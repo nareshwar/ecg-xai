@@ -3,6 +3,6 @@ from preprocessing import preprocess_for_model, load_mat_TF
 from lime import run_lime_for_one_class_from_sel
 from payload import payload_from_lime_row
 from plot import plot_from_payload
-from run_explain import run_explain_for_one_class, run_pipeline_for_classes
+from explainer import run_explain_for_one_class, run_pipeline_for_classes
 from segments import *
 from eval import evaluate_explanation, REGISTRY
