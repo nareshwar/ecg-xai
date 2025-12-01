@@ -248,8 +248,12 @@ REGISTRY: Dict[str, ClassConfig] = {
     "sinus arrhythmia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
     "bradycardia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF"), ("pre",)),
     "atrial fibrillation": ClassConfig(
-        strict_leads=LEADS12,
-        lenient_leads=LEADS12,
+        strict_leads=("II", "V1"),
+        lenient_leads=(
+            "II", "V1",
+            "V2", "aVF", "I",
+            "V5", "V6", "aVR",
+        ),
         window_keys=("beat",),
     ),
     "atrial flutter": ClassConfig(

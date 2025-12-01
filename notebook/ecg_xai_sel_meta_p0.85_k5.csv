@@ -1,0 +1,6 @@
+group_class,filename,sel_idx,duration_sec,prob_meta
+164889003,C:\data\ptbxl-electrocardiography-database\WFDB\HR12849.mat,34038,10.0,0.9949918985366821
+164889003,C:\data\georgia-12lead-ecg-challenge-database\Georgia\E02829.mat,13158,10.0,0.9668751955032349
+164889003,C:\data\ptbxl-electrocardiography-database\WFDB\HR06693.mat,27882,10.0,0.9999983906745911
+164889003,C:\data\china-physiological-signal-challenge-in-2018\Training_WFDB\A0684.mat,4136,10.0,0.9872055053710938
+164889003,C:\data\georgia-12lead-ecg-challenge-database\Georgia\E02523.mat,12852,10.0,0.9501098394393921
