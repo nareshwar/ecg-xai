@@ -281,13 +281,20 @@ def run_timeshap_for_one_class_from_sel(
     if rows.empty:
         raise ValueError(f"No rows in sel_df with group_class == {class_name!r}")
 
-    # default params if none given
+    # normalise / default params
     if params is None:
         params = {
             "event_kind": "uniform",
             "window_sec": float(window_sec),
             "lead_prior": None,
         }
+    else:
+        params = dict(params)
+        params.setdefault("event_kind", "uniform")
+        params.setdefault("window_sec", float(window_sec))
+        params.setdefault("lead_prior", None)
+
+    window_sec_eff = float(params.get("window_sec", window_sec))
 
     c_force = class_index(class_names, class_name) if explain_class == "force" else None
 
@@ -299,10 +306,7 @@ def run_timeshap_for_one_class_from_sel(
         hea_path, mat_path = ensure_paths(r["filename"])
         fs, lead_names = parse_fs_and_leads(hea_path, default_fs=500.0)
 
-        lead_prior_probs = prior_probs_from_names(
-            lead_names,
-            params.get("lead_prior") if params else None,
-        )
+        lead_prior_probs = prior_probs_from_names(lead_names, params.get("lead_prior") if params else None)
         lead_prior_weights = lead_prior_probs
 
         x_tf = load_mat_TF(mat_path)  # (T, F)
@@ -380,7 +384,7 @@ def run_timeshap_for_one_class_from_sel(
                 "hea_path": hea_path,
                 "mat_path": mat_path,
                 "fs": float(fs),
-                "window_sec": float(window_sec),
+                "window_sec": float(window_sec_eff),
                 "target_class_explained": int(c),
                 # event-level
                 "timeshap_event_values_json": json.dumps(

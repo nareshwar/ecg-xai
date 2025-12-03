@@ -8,22 +8,86 @@ from fusion import fuse_lime_timeshap_payload
 from payload import payload_from_lime_row, payload_from_timeshap_row
 from plot import plot_from_payload
 
+# ---------------------------------------------------------------------
+# Lead-prior registry keyed by SNOMED CT codes for your target classes.
+# You can extend this as you add more diagnoses.
+# ---------------------------------------------------------------------
+
+LEAD_PRIOR_BY_SNOMED: Dict[str, Dict[str, float]] = {
+    # 426783006: sinus rhythm
+    "426783006": {
+        # core: highest
+        "II": 1.0,
+        "V1": 1.0,
+        # extended: still strong
+        "I": 0.8,
+        "aVF": 0.8,
+        "V2": 0.8,
+    },
+
+    # 164889003: AF (example)
+    "164889003": {
+        "II": 1.0,
+        "V1": 0.9,
+        "III": 0.7,
+        "aVF": 0.6,
+        "V2": 0.5,
+    },
+
+    # 17338001: PVC (example)
+    "17338001": {
+        "V1": 1.0,
+        "V2": 0.9,
+        "V3": 0.8,
+        "V4": 0.8,
+        "II": 0.6,
+    },
+}
+
+WINDOW_SEC_BY_SNOMED: Dict[str, float] = {
+    "426783006": 0.25,   # e.g. shorter windows around P/QRS
+    "164889003": 0.5,
+    "17338001": 0.4,
+}
+
+def lead_prior_for_class_name(class_name: str) -> Optional[Dict[str, float]]:
+    """Return a dict[lead_name -> weight in 0..1] for a SNOMED code.
+
+    If the class is not in the registry, returns None and the explainer
+    will fall back to uniform feature sampling.
+    """
+    if class_name is None:
+        return None
+    return LEAD_PRIOR_BY_SNOMED.get(str(class_name))
 
 def default_explainer_config(class_name: str) -> Dict[str, object]:
     """
-    Return LIME hyperparameters for a given class.
+    Return explainer hyperparameters for a given class.
 
-    For now we ignore class_name and return the same config for all diagnoses.
-    Later you can plug in your EXPLAIN_PRESETS / CLASS_TO_PRESET logic here.
+    This is the central place where you can specialise settings per class:
+        - window_sec, m_event, m_feat, topk_events, mode
+        - lead_prior used by both LIME and TimeSHAP
     """
-    return {
-        "window_sec": 0.5,   # segment length in seconds
-        "m_event": 200,      # number of event-level masks
-        "m_feat": 200,       # number of feature-level masks
-        "topk_events": 5,    # how many top events to refine per-lead
-        "mode": "context",   # 'context' or 'isolated'
+    base_window = 0.5  # default if class not in WINDOW_SEC_BY_SNOMED
+    window_sec = float(WINDOW_SEC_BY_SNOMED.get(str(class_name), base_window))
+
+    # Look up a lead-prior dict for this SNOMED code, if available.
+    lead_prior = lead_prior_for_class_name(class_name)
+
+    params = {
+        "event_kind": "uniform",   # currently only uniform windows implemented
+        "window_sec": window_sec,
+        "lead_prior": lead_prior,
     }
 
+    return {
+        "window_sec": window_sec,   # segment length in seconds
+        "m_event": 300,             # number of event-level masks
+        "m_feat": 400,              # number of feature-level masks
+        "topk_events": 5,           # how many top events to refine per-lead
+        "mode": "context",          # 'context' or 'isolated'
+        "params": params,           # shared params for LIME + TimeSHAP
+    }
 
 def run_explain_for_one_class(
     class_name: str,
@@ -68,6 +132,7 @@ def run_explain_for_one_class(
         explain_class="force",
         mode=cfg["mode"],
         rng=42,
+        params=cfg.get("params"),
     )
 
     # Optionally limit number of examples per class
@@ -171,6 +236,7 @@ def run_fused_for_one_class(
         explain_class="force",
         mode=cfg["mode"],
         rng=42,
+        params=cfg.get("params"), 
     )
 
     # TimeSHAP
@@ -187,7 +253,7 @@ def run_fused_for_one_class(
         mode=cfg["mode"],
         rng=42,
         link="logit",
-        params=None,
+        params=cfg.get("params"), 
     )
 
     # Optionally limit number of examples
@@ -266,6 +332,7 @@ def run_fused_pipeline_for_classes(
             max_examples=max_examples_per_class,
             plot=plot,
         )
+
         all_fused_payloads[cls] = fused_payloads_cls
         all_lime.append(df_lime_cls)
         all_ts.append(df_ts_cls)

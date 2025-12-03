@@ -242,7 +242,11 @@ class ClassConfig:
 
 REGISTRY: Dict[str, ClassConfig] = {
     # Atrial / sinus
-    "sinus rhythm": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
+    "sinus rhythm": ClassConfig(
+        ("II", "V1",),                     # core leads
+        ("II", "V1", "I", "aVF", "V2"),   # extended
+        ("pre",),                         # tokens of interest
+    ),
     "sinus tachycardia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
     "sinus bradycardia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
     "sinus arrhythmia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
@@ -603,7 +607,6 @@ def _apply_deletions(
             y[s_i:e_i, i] = base[i]
 
     return y
-
 
 @dataclass
 class DeletionCurve:
