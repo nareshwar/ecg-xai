@@ -13,19 +13,21 @@ from plot import plot_from_payload
 # You can extend this as you add more diagnoses.
 # ---------------------------------------------------------------------
 
+from typing import Sequence, Dict, Optional, Tuple
+
+# ---------------------------------------------------------------------
+# Lead-prior registry keyed by SNOMED CT codes for your target classes.
+# ---------------------------------------------------------------------
 LEAD_PRIOR_BY_SNOMED: Dict[str, Dict[str, float]] = {
     # 426783006: sinus rhythm
     "426783006": {
-        # core: highest
         "II": 1.0,
         "V1": 1.0,
-        # extended: still strong
         "I": 0.8,
         "aVF": 0.8,
         "V2": 0.8,
     },
-
-    # 164889003: AF (example)
+    # 164889003: atrial fibrillation
     "164889003": {
         "II": 1.0,
         "V1": 0.9,
@@ -33,8 +35,7 @@ LEAD_PRIOR_BY_SNOMED: Dict[str, Dict[str, float]] = {
         "aVF": 0.6,
         "V2": 0.5,
     },
-
-    # 17338001: PVC (example)
+    # 17338001: ventricular premature beats
     "17338001": {
         "V1": 1.0,
         "V2": 0.9,
@@ -44,35 +45,48 @@ LEAD_PRIOR_BY_SNOMED: Dict[str, Dict[str, float]] = {
     },
 }
 
+# Optional: per-class window size (seconds)
 WINDOW_SEC_BY_SNOMED: Dict[str, float] = {
-    "426783006": 0.25,   # e.g. shorter windows around P/QRS
+    "426783006": 0.25,  # sinus rhythm: shorter window
     "164889003": 0.5,
     "17338001": 0.4,
 }
 
-def lead_prior_for_class_name(class_name: str) -> Optional[Dict[str, float]]:
-    """Return a dict[lead_name -> weight in 0..1] for a SNOMED code.
+# Global default window if class not in WINDOW_SEC_BY_SNOMED
+BASE_WINDOW_SEC: float = 0.5
 
-    If the class is not in the registry, returns None and the explainer
-    will fall back to uniform feature sampling.
-    """
+
+def lead_prior_for_class_name(class_name: str) -> Optional[Dict[str, float]]:
+    """Return a dict[lead_name -> weight in 0..1] for a SNOMED code."""
     if class_name is None:
         return None
     return LEAD_PRIOR_BY_SNOMED.get(str(class_name))
+
 
 def default_explainer_config(class_name: str) -> Dict[str, object]:
     """
     Return explainer hyperparameters for a given class.
 
-    This is the central place where you can specialise settings per class:
-        - window_sec, m_event, m_feat, topk_events, mode
-        - lead_prior used by both LIME and TimeSHAP
+    Central place to specialise settings per class:
+      - window_sec, m_event, m_feat, topk_events, mode
+      - lead_prior used by both LIME and TimeSHAP
     """
-    base_window = 0.5  # default if class not in WINDOW_SEC_BY_SNOMED
-    window_sec = float(WINDOW_SEC_BY_SNOMED.get(str(class_name), base_window))
+    code = str(class_name)
 
-    # Look up a lead-prior dict for this SNOMED code, if available.
-    lead_prior = lead_prior_for_class_name(class_name)
+    # --- base settings --------------------------------------------------
+    window_sec = float(WINDOW_SEC_BY_SNOMED.get(code, BASE_WINDOW_SEC))
+    m_event = 200
+    m_feat = 200
+    mode = "context"
+
+    # --- special case: sinus rhythm (426783006) ------------------------
+    if code == "426783006":
+        # keep window_sec from the map (0.30), just bump masks
+        m_event = 300
+        m_feat = 400
+
+    # lead priors (may be None if class not in LEAD_PRIOR_BY_SNOMED)
+    lead_prior = lead_prior_for_class_name(code)
 
     params = {
         "event_kind": "uniform",   # currently only uniform windows implemented
@@ -82,12 +96,13 @@ def default_explainer_config(class_name: str) -> Dict[str, object]:
 
     return {
         "window_sec": window_sec,   # segment length in seconds
-        "m_event": 300,             # number of event-level masks
-        "m_feat": 400,              # number of feature-level masks
+        "m_event": m_event,         # number of event-level masks
+        "m_feat": m_feat,           # number of feature-level masks
         "topk_events": 5,           # how many top events to refine per-lead
-        "mode": "context",          # 'context' or 'isolated'
+        "mode": mode,               # 'context' or 'isolated'
         "params": params,           # shared params for LIME + TimeSHAP
     }
+
 
 def run_explain_for_one_class(
     class_name: str,
@@ -282,6 +297,14 @@ def run_fused_for_one_class(
             label_for_title=row_T.get("group_class", class_name),
         )
 
+        code = str(class_name)
+
+        # default: equal weights
+        method_weights = (0.5, 0.5)
+
+        if code == "426783006":  # sinus rhythm
+            method_weights = (0.7, 0.3)  # (LIME, TimeSHAP)
+
         # Simple fuse settings (you can specialize per class later)
         payload_F = fuse_lime_timeshap_payload(
             payload_L,
@@ -290,6 +313,7 @@ def run_fused_for_one_class(
             beta=1.0,
             tau=0.02,
             topk=5,
+            method_weights=method_weights,
         )
 
         fused_payloads[int(val_i)] = payload_F

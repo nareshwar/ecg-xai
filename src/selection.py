@@ -57,6 +57,7 @@ def build_selection_df_with_aliases(
     min_prob: float = 0.85,
     random_seed: int = 42,
     max_duration_sec: float | None = 20.0,
+    duration_cache_path: str | None = None,
 ) -> pd.DataFrame:
     """
     Select up to k_per_class ECGs per meta-class defined in target_meta.
@@ -94,13 +95,31 @@ def build_selection_df_with_aliases(
     # -------------------------------------------------------
     # Duration filter: only keep ECGs with duration <= max_duration_sec
     # -------------------------------------------------------
+    # -------------------------------------------------------
+    # Duration filter: only keep ECGs with duration <= max_duration_sec
+    # -------------------------------------------------------
     if max_duration_sec is not None:
         print(f"[INFO] Estimating durations and keeping ECGs <= {max_duration_sec:.1f} s...")
-        durations = np.empty(N, dtype=float)
-        durations[:] = np.nan
 
-        for i, fpath in enumerate(ecg_filenames):
-            durations[i] = _estimate_duration_sec_from_header(str(fpath))
+        durations = None
+
+        # Try cache first, if provided
+        if duration_cache_path is not None and os.path.exists(duration_cache_path):
+            durations = np.load(duration_cache_path)
+            if durations.shape[0] != N:
+                print("[WARN] duration cache has wrong length; recomputing.")
+                durations = None
+
+        if durations is None:
+            durations = np.empty(N, dtype=float)
+            durations[:] = np.nan
+
+            for i, fpath in enumerate(ecg_filenames):
+                durations[i] = _estimate_duration_sec_from_header(str(fpath))
+
+            if duration_cache_path is not None:
+                np.save(duration_cache_path, durations)
+                print(f"[INFO] Saved duration cache to {duration_cache_path}")
 
         # valid & <= max_duration_sec
         dur_mask = np.isfinite(durations) & (durations <= float(max_duration_sec))
@@ -111,6 +130,7 @@ def build_selection_df_with_aliases(
             print("[WARN] No ECGs passed the duration filter – selection will be empty.")
     else:
         dur_mask = np.ones(N, dtype=bool)
+        durations = np.full(N, np.nan, dtype=float)
 
     rows = []
 
