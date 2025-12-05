@@ -79,12 +79,6 @@ def default_explainer_config(class_name: str) -> Dict[str, object]:
     m_feat = 200
     mode = "context"
 
-    # --- special case: sinus rhythm (426783006) ------------------------
-    if code == "426783006":
-        # keep window_sec from the map (0.30), just bump masks
-        m_event = 300
-        m_feat = 400
-
     # lead priors (may be None if class not in LEAD_PRIOR_BY_SNOMED)
     lead_prior = lead_prior_for_class_name(code)
 

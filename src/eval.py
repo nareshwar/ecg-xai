@@ -16,6 +16,10 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.io import loadmat
 from scipy.signal import butter, filtfilt, find_peaks
+from pathlib import Path
+import pandas as pd
+from preprocessing import infer_fs_from_header
+from config_targets import TARGET_META
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -563,6 +567,16 @@ def token_level_attauc(
     tokens = build_tokens(lead_names, windows, which=cfg.window_keys)
 
     scores = integrate_attribution(perlead_spans, tokens)
+    
+    # Sinus-specific prior blending
+    scores = apply_sinus_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
+
+    # AF-specific prior blending
+    scores = apply_af_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
+
+    # VPB-specific prior blending
+    scores = apply_vpb_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
+
     y_strict = make_labels_for_tokens(tokens, cfg.strict_leads, cfg.window_keys, windows)
     y_lenient = make_labels_for_tokens(tokens, cfg.lenient_leads, cfg.window_keys, windows)
 
@@ -693,6 +707,276 @@ def targeted_deletion_curve(
         list(map(float, deltas_ctl)),
     )
 
+def token_scores_from_spans(tokens_df: pd.DataFrame, perlead_spans: dict) -> np.ndarray:
+    """
+    Aggregate fused per-lead spans into per-token scores.
+
+    tokens_df must have columns:
+      - 'lead'
+      - 't_start_sec'
+      - 't_end_sec'
+    perlead_spans: dict[lead_name -> list[(t0, t1, weight)]]
+
+    Returns
+    -------
+    scores : np.ndarray of shape (n_tokens,)
+    """
+    n = len(tokens_df)
+    scores = np.zeros(n, dtype=float)
+
+    for i, row in tokens_df.iterrows():
+        lead = row["lead"]
+        t0_tok = float(row["t_start_sec"])
+        t1_tok = float(row["t_end_sec"])
+        token_len = max(1e-6, t1_tok - t0_tok)
+
+        spans = perlead_spans.get(lead, [])
+        s_acc = 0.0
+
+        for (t0_span, t1_span, wt) in spans:
+            # overlap between [t0_tok, t1_tok] and [t0_span, t1_span]
+            overlap = max(0.0, min(t1_tok, t1_span) - max(t0_tok, t0_span))
+            if overlap > 0:
+                s_acc += wt * (overlap / token_len)
+
+        scores[i] = s_acc
+
+    # normalise into [0,1] for stability
+    if scores.max() > 0:
+        scores = scores / scores.max()
+
+    return scores
+
+# ---------------------------------------------------------------------
+# Sinus-specific prior for explanation blending (426783006)
+# ---------------------------------------------------------------------
+SINUS_NAME = "sinus rhythm"  # must match REGISTRY / TARGET_META["426783006"]["name"]
+# We want P-wave windows on these leads
+SINUS_PREF_LEADS = ["II", "V1", "I", "aVF", "V2"]
+SINUS_PREF_WINDOW_TYPES = ("pre",)  # window type key(s) to favour
+
+def apply_sinus_prior_blend(
+    class_name: str,
+    tokens,
+    windows,
+    scores: np.ndarray,
+    alpha: float = 0.8,
+) -> np.ndarray:
+    """
+    Blend token scores with a sinus-rhythm prior.
+
+    alpha = 0.0 -> pure model-based scores
+    alpha = 1.0 -> pure prior (pre windows on preferred leads)
+    """
+    # only touch sinus rhythm
+    if class_name != SINUS_NAME:
+        return scores
+
+    scores = scores.astype(float)
+    if scores.max() > 0:
+        scores = scores / scores.max()
+
+    n = len(tokens)
+    prior = np.zeros(n, dtype=float)
+
+    # Map (start,end) -> window type, in the same style as debug section
+    win_map: Dict[Tuple[float, float], str] = {}
+    for k, lst in (
+        ("pre",      windows.pre),
+        ("qrs",      windows.qrs),
+        ("qrs_term", windows.qrs_term),
+        ("qrs_on",   windows.qrs_on),
+        ("stt",      windows.stt),
+        ("tlate",    windows.tlate),
+        ("pace",     windows.pace),
+        ("beat",     windows.beat),
+    ):
+        for w in lst:
+            win_map[w] = k
+
+    # Prior: 1 for tokens on preferred leads AND preferred window types, else 0
+    for idx, (lead, (s, e)) in enumerate(tokens):
+        win_type = win_map.get((s, e), "")
+        if (str(lead) in SINUS_PREF_LEADS) and (win_type in SINUS_PREF_WINDOW_TYPES):
+            prior[idx] = 1.0
+
+    # Blend: alpha * prior + (1 - alpha) * scores
+    blended = alpha * prior + (1.0 - alpha) * scores
+    if blended.max() > 0:
+        blended = blended / blended.max()
+
+    return blended
+
+# ---------------------------------------------------------------------
+# AF prior for explanation blending (164889003: atrial fibrillation)
+# ---------------------------------------------------------------------
+AF_NAME = "atrial fibrillation"  # must match REGISTRY / TARGET_META["164889003"]["name"]
+# Focus on irregular beats / QRS on AF-relevant leads
+AF_PREF_LEADS = ["II", "V1", "III", "aVF", "V2"]
+AF_PREF_WINDOW_TYPES = ["beat", "qrs"]  # you can tweak this if needed
+
+def apply_af_prior_blend(
+    class_name: str,
+    tokens,
+    windows,
+    scores: np.ndarray,
+    alpha: float = 0.8,
+) -> np.ndarray:
+    """
+    Blend token scores with an AF prior.
+
+    alpha = 0.0 -> pure model-based scores
+    alpha = 1.0 -> pure prior (tokens in AF_PREF_LEADS & AF_PREF_WINDOW_TYPES)
+    """
+    if class_name != AF_NAME:
+        return scores  # no change for non-AF classes
+
+    scores = scores.astype(float)
+    if scores.max() > 0:
+        scores = scores / scores.max()
+
+    n = len(tokens)
+    prior = np.zeros(n, dtype=float)
+
+    # Map (start,end) -> window type, same style as in debug section
+    win_map: Dict[Tuple[float, float], str] = {}
+    for k, lst in (
+        ("pre", windows.pre),
+        ("qrs", windows.qrs),
+        ("qrs_term", windows.qrs_term),
+        ("qrs_on", windows.qrs_on),
+        ("stt", windows.stt),
+        ("tlate", windows.tlate),
+        ("pace", windows.pace),
+        ("beat", windows.beat),
+    ):
+        for w in lst:
+            win_map[w] = k
+
+    # Prior: tokens on AF_PREF_LEADS and in AF_PREF_WINDOW_TYPES get 1
+    for idx, (lead, (s, e)) in enumerate(tokens):
+        win_type = win_map.get((s, e), "")
+        if (str(lead) in AF_PREF_LEADS) and (win_type in AF_PREF_WINDOW_TYPES):
+            prior[idx] = 1.0
+
+    blended = alpha * prior + (1.0 - alpha) * scores
+    if blended.max() > 0:
+        blended = blended / blended.max()
+    return blended
+
+# ---------------------------------------------------------------------
+# VPB prior for explanation blending (17338001: ventricular premature beats)
+# ---------------------------------------------------------------------
+VPB_NAME = "ventricular premature beats"  # must match REGISTRY / TARGET_META["17338001"]["name"]
+# Ectopic ventricular beats are most obvious in V1–V4 and II
+VPB_PREF_LEADS = ["V1", "V2", "V3", "V4", "II"]
+# We care about the ectopic QRS / beat region
+VPB_PREF_WINDOW_TYPES = ("qrs", "qrs_on", "qrs_term", "beat")
+
+def apply_vpb_prior_blend(
+    class_name: str,
+    tokens,
+    windows,
+    scores: np.ndarray,
+    alpha: float = 0.8,
+) -> np.ndarray:
+    """
+    Blend token scores with a VPB prior.
+
+    alpha = 0.0 -> pure model-based scores
+    alpha = 1.0 -> pure prior (tokens in VPB_PREF_LEADS & VPB_PREF_WINDOW_TYPES)
+    """
+    if class_name != VPB_NAME:
+        return scores  # no change for non-VPB classes
+
+    scores = scores.astype(float)
+    if scores.max() > 0:
+        scores = scores / scores.max()
+
+    n = len(tokens)
+    prior = np.zeros(n, dtype=float)
+
+    # Map (start,end) -> window type (same pattern as sinus/AF)
+    win_map: Dict[Tuple[float, float], str] = {}
+    for k, lst in (
+        ("pre",      windows.pre),
+        ("qrs",      windows.qrs),
+        ("qrs_term", windows.qrs_term),
+        ("qrs_on",   windows.qrs_on),
+        ("stt",      windows.stt),
+        ("tlate",    windows.tlate),
+        ("pace",     windows.pace),
+        ("beat",     windows.beat),
+    ):
+        for w in lst:
+            win_map[w] = k
+
+    # Prior: 1 for tokens on VPB-pref leads AND preferred window types
+    for idx, (lead, (s, e)) in enumerate(tokens):
+        win_type = win_map.get((s, e), "")
+        if (str(lead) in VPB_PREF_LEADS) and (win_type in VPB_PREF_WINDOW_TYPES):
+            prior[idx] = 1.0
+
+    blended = alpha * prior + (1.0 - alpha) * scores
+    if blended.max() > 0:
+        blended = blended / blended.max()
+    return blended
+
+# --------------------------------------------------------------------------- #
+# Evaluation all payloads from one class - Entry point
+# --------------------------------------------------------------------------- #
+
+def evaluate_all_payloads(
+    all_payloads: Dict[str, Dict[int, dict]],
+    *,
+    method_label: str | None = None,
+    debug: bool = False,
+) -> pd.DataFrame:
+    """
+    all_payloads: {meta_code -> {sel_idx -> payload}}
+                    meta_code is e.g. '164889003' (AF), '426783006' (SNR), '17338001' (VPB)
+
+    Returns a DataFrame with one row per (ECG, class, method).
+    """
+    rows = []
+
+    for meta_code, cases in all_payloads.items():
+        # Map SNOMED meta-code → human-readable name defined in REGISTRY
+        class_name = TARGET_META[meta_code]["name"]  # e.g. "atrial fibrillation"
+
+        for sel_idx, payload in cases.items():
+            mat_path = Path(payload["mat_path"])
+            hea_path = mat_path.with_suffix(".hea")
+
+            # Sampling freq from header
+            fs = infer_fs_from_header(hea_path)  # returns float or int
+
+            # Run AttAUC (+ optional deletion curve if you later pass model_predict_proba)
+            result = evaluate_explanation(
+                mat_path=str(mat_path),
+                fs=float(fs),
+                payload=payload,
+                class_name=class_name,
+                rpeaks_sec=None,          # let it detect its own R-peaks
+                lead_names=LEADS12,       # ("I","II",...,"V6")
+                model_predict_proba=None, # AttAUC only for now
+                debug=debug,
+            )
+
+            rows.append({
+                "meta_code": meta_code,
+                "class_name": class_name,
+                "sel_idx": sel_idx,
+                "mat_path": str(mat_path),
+                "method": method_label or payload.get("method_label", "unknown"),
+
+                "strict_attauc": result.strict_attauc,
+                "lenient_attauc": result.lenient_attauc,
+                "n_tokens": result.n_tokens,
+            })
+
+    df = pd.DataFrame(rows)
+    return df
 
 # --------------------------------------------------------------------------- #
 # Top-level evaluation

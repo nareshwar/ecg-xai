@@ -46,7 +46,6 @@ def _estimate_duration_sec_from_header(mat_path: str, default_fs: float = 500.0)
 
     return nsamp / fs
 
-
 def build_selection_df_with_aliases(
     ecg_filenames: Sequence[str],
     probs: np.ndarray,
@@ -211,3 +210,65 @@ def build_selection_df_with_aliases(
 
     sel_df = pd.DataFrame(rows)
     return sel_df
+
+import numpy as np
+import re
+from typing import Sequence
+
+
+def parse_dx_codes(raw_label: str) -> list[str]:
+    """
+    Parse a PhysioNet-style DX string into a list of SNOMED codes.
+
+    Examples of raw_label:
+      "426783006, 164889003"
+      "426783006"
+    """
+    if raw_label is None:
+        return []
+
+    # If parse_header already gives you just "426783006,164889003",
+    # this is enough.
+    s = str(raw_label).strip()
+    if not s:
+        return []
+
+    # split on commas / semicolons / whitespace
+    tokens = re.split(r"[,\s;]+", s)
+    codes = [t for t in tokens if t]
+    return codes
+
+def build_y_true_from_labels(
+    labels: Sequence[str],
+    class_names: Sequence[str],
+) -> np.ndarray:
+    """
+    Build multi-hot y_true matrix aligned with class_names.
+
+    labels      : list of raw DX strings from import_key_data
+    class_names : SNOMED codes for each model output (length C)
+
+    Returns
+    -------
+    y_true : (N, C) int8 array with 0/1 entries.
+    """
+    labels = list(labels)
+    class_names = np.asarray(class_names).astype(str)
+
+    N = len(labels)
+    C = len(class_names)
+
+    y_true = np.zeros((N, C), dtype=np.int8)
+
+    # map SNOMED code -> column index
+    name_to_idx = {code: i for i, code in enumerate(class_names)}
+
+    for i, raw in enumerate(labels):
+        codes = parse_dx_codes(raw)
+        for code in codes:
+            j = name_to_idx.get(str(code))
+            if j is not None:
+                y_true[i, j] = 1  # multi-label
+
+    return y_true
+

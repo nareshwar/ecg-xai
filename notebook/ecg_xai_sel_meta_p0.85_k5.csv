@@ -1,6 +1,4 @@
 group_class,filename,sel_idx,duration_sec,prob_meta
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR16693.mat,37882,10.0,0.9859257936477661
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR09296.mat,30485,10.0,0.9564534425735474
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR14008.mat,35197,10.0,0.931736171245575
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR01607.mat,22796,10.0,0.9972021579742432
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR09164.mat,30353,10.0,0.9921467304229736
+17338001,C:\data\georgia-12lead-ecg-challenge-database\Georgia\E01832.mat,12161,10.0,0.5146889090538025
+17338001,C:\data\georgia-12lead-ecg-challenge-database\Georgia\E04603.mat,14932,10.0,0.9999423027038574
+17338001,C:\data\georgia-12lead-ecg-challenge-database\Georgia\E00502.mat,10831,10.0,0.6267651319503784
