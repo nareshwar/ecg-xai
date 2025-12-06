@@ -4,8 +4,15 @@ ECG explanation evaluator (class-aware windows, HR-adaptive).
 Provides:
 - BeatWindows: heart-rate aware diagnostic windows around each R-peak
 - REGISTRY: mapping from class name -> which leads/windows are "ground truth"
-- AttAUC and deletion-curve metrics
+- Token-level metrics:
+    * AttAUC (strict / lenient)  [ranking-based accuracy]
+    * F1    (strict / lenient)   [threshold-based accuracy]
+- Faithfulness metrics:
+    * Deletion curve per ECG
+    * Deletion AUC (lower = more faithful)
+
 - evaluate_explanation(): main entry point for a single ECG + payload
+- evaluate_all_payloads(): batched evaluation over fused payloads
 """
 
 from __future__ import annotations
@@ -13,11 +20,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import math
 import numpy as np
+import pandas as pd
 from scipy.io import loadmat
 from scipy.signal import butter, filtfilt, find_peaks
 from pathlib import Path
-import pandas as pd
+from sklearn.metrics import f1_score
+
 from preprocessing import infer_fs_from_header
 from config_targets import TARGET_META
 
@@ -25,7 +35,11 @@ from config_targets import TARGET_META
 # Constants
 # --------------------------------------------------------------------------- #
 
-LEADS12: Tuple[str, ...] = ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6")
+LEADS12: Tuple[str, ...] = (
+    "I", "II", "III", "aVR", "aVL", "aVF",
+    "V1", "V2", "V3", "V4", "V5", "V6"
+)
+
 
 # --------------------------------------------------------------------------- #
 # Basic I/O
@@ -107,7 +121,7 @@ def detect_rpeaks(
     fs : sampling frequency in Hz
     prefer : which leads to prioritize for detection
     lead_names : names corresponding to columns of x
-    refractory_ms : minimum distance between peaks
+    refractory_ms : minimum distance between peaks (ms)
     min_prom : minimum prominence passed to scipy.find_peaks
 
     Returns
@@ -221,14 +235,14 @@ def build_windows_from_rpeaks(
     beat: List[Tuple[float, float]] = []
 
     for r in r_sec:
-        pre.append((r - pre_lo, r - pre_hi))
-        qrs_on.append((r - q_on_lo, r - q_on_hi))
-        qrs.append((r - 0.05, r + qrs_early_post))
-        qrs_term.append((r + 0.04, r + qrs_term_post))
-        stt.append((r + 0.06, r + 0.20))
-        tlate.append((r + 0.20, r + 0.40))
-        pace.append((r - 0.01, r + 0.02))
-        beat.append((r - 0.30, r + 0.40))
+        pre.append((r - pre_lo,        r - pre_hi))
+        qrs_on.append((r - q_on_lo,    r - q_on_hi))
+        qrs.append((r - 0.05,          r + qrs_early_post))
+        qrs_term.append((r + 0.04,     r + qrs_term_post))
+        stt.append((r + 0.06,          r + 0.20))
+        tlate.append((r + 0.20,        r + 0.40))
+        pace.append((r - 0.01,         r + 0.02))
+        beat.append((r - 0.30,         r + 0.40))
 
     return BeatWindows(pre, qrs, qrs_term, qrs_on, stt, tlate, pace, beat)
 
@@ -247,19 +261,34 @@ class ClassConfig:
 REGISTRY: Dict[str, ClassConfig] = {
     # Atrial / sinus
     "sinus rhythm": ClassConfig(
-        ("II", "V1",),                     # core leads
-        ("II", "V1", "I", "aVF", "V2"),   # extended
-        ("pre",),                         # tokens of interest
+        ("II", "V1",),
+        ("II", "V1", "I", "aVF", "V2"),
+        ("pre",),
     ),
-    "sinus tachycardia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
-    "sinus bradycardia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
-    "sinus arrhythmia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF", "V2"), ("pre",)),
-    "bradycardia": ClassConfig(("II", "V1"), ("II", "V1", "I", "aVF"), ("pre",)),
+    "sinus tachycardia": ClassConfig(
+        ("II", "V1"),
+        ("II", "V1", "I", "aVF", "V2"),
+        ("pre",),
+    ),
+    "sinus bradycardia": ClassConfig(
+        ("II", "V1"),
+        ("II", "V1", "I", "aVF", "V2"),
+        ("pre",),
+    ),
+    "sinus arrhythmia": ClassConfig(
+        ("II", "V1"),
+        ("II", "V1", "I", "aVF", "V2"),
+        ("pre",),
+    ),
+    "bradycardia": ClassConfig(
+        ("II", "V1"),
+        ("II", "V1", "I", "aVF"),
+        ("pre",),
+    ),
     "atrial fibrillation": ClassConfig(
         strict_leads=("II", "V1"),
         lenient_leads=(
-            "II", "V1",
-            "V2", "aVF", "I",
+            "II", "V1", "V2", "aVF", "I",
             "V5", "V6", "aVR",
         ),
         window_keys=("beat",),
@@ -383,17 +412,25 @@ REGISTRY: Dict[str, ClassConfig] = {
 # --------------------------------------------------------------------------- #
 
 def _overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """Length of intersection between intervals a and b."""
     s = max(a[0], b[0])
     e = min(a[1], b[1])
     return max(0.0, e - s)
 
 
-def integrate_attribution(perlead_spans, tokens):
+def integrate_attribution(
+    perlead_spans: Dict[str, List[Tuple[float, float, float]]],
+    tokens: List[Tuple[str, Tuple[float, float]]],
+) -> np.ndarray:
     """
     Sum |weight| × overlap over all spans for each token.
 
     perlead_spans : dict[lead -> list[(start, end, weight)]]
     tokens        : list[(lead, (start, end))]
+
+    Returns
+    -------
+    scores : token-level "mass" scores (higher = more attribution).
     """
     scores = np.zeros(len(tokens), dtype=np.float64)
 
@@ -414,6 +451,10 @@ def integrate_attribution(perlead_spans, tokens):
 def rank_auc(scores: np.ndarray, labels: np.ndarray) -> float:
     """
     Wilcoxon/AUC calculation for how well high scores rank positive labels.
+
+    This is a ranking-based accuracy metric:
+        - 1.0 means all positive tokens are ranked above all negatives.
+        - 0.5 is random.
     """
     labels = labels.astype(int)
     P = labels.sum()
@@ -443,13 +484,15 @@ def scores_to_density(
 ) -> np.ndarray:
     """
     Convert overlap-mass scores to duration-normalized density.
+
+    Mainly used for debug visualisation.
     """
     durations = np.array([float(w[1] - w[0]) for _, w in tokens], dtype=np.float64)
     return scores / np.maximum(durations, eps)
 
 
 # --------------------------------------------------------------------------- #
-# Tokens / labels
+# Tokens / labels / F1
 # --------------------------------------------------------------------------- #
 
 def build_tokens(
@@ -462,14 +505,14 @@ def build_tokens(
     requested window families.
     """
     key_to_list = {
-        "pre": windows.pre,
-        "qrs": windows.qrs,
+        "pre":      windows.pre,
+        "qrs":      windows.qrs,
         "qrs_term": windows.qrs_term,
-        "qrs_on": windows.qrs_on,
-        "stt": windows.stt,
-        "tlate": windows.tlate,
-        "pace": windows.pace,
-        "beat": windows.beat,
+        "qrs_on":   windows.qrs_on,
+        "stt":      windows.stt,
+        "tlate":    windows.tlate,
+        "pace":     windows.pace,
+        "beat":     windows.beat,
     }
 
     time_windows: List[Tuple[float, float]] = []
@@ -497,14 +540,14 @@ def make_labels_for_tokens(
     win_map: Dict[Tuple[float, float], str] = {}
 
     for k, lst in (
-        ("pre", windows.pre),
-        ("qrs", windows.qrs),
+        ("pre",      windows.pre),
+        ("qrs",      windows.qrs),
         ("qrs_term", windows.qrs_term),
-        ("qrs_on", windows.qrs_on),
-        ("stt", windows.stt),
-        ("tlate", windows.tlate),
-        ("pace", windows.pace),
-        ("beat", windows.beat),
+        ("qrs_on",   windows.qrs_on),
+        ("stt",      windows.stt),
+        ("tlate",    windows.tlate),
+        ("pace",     windows.pace),
+        ("beat",     windows.beat),
     ):
         for w in lst:
             win_map[w] = k
@@ -520,15 +563,58 @@ def make_labels_for_tokens(
     return labels
 
 
+def best_f1_for_labels(scores: np.ndarray, y: np.ndarray) -> float:
+    """
+    Compute max F1 over all unique score thresholds.
+
+    Here we treat the explainer as a binary classifier over tokens:
+        score >= tau  -> predicted important
+        score <  tau  -> predicted unimportant
+
+    F1 is computed against the strict/lenient token labels.
+    """
+    if y.sum() == 0 or y.sum() == len(y):
+        # no positives or no negatives: F1 not very meaningful
+        return float("nan")
+
+    thresholds = np.unique(scores)[::-1]  # candidate cutoffs (high -> low)
+
+    best = 0.0
+    for tau in thresholds:
+        y_hat = scores >= tau
+        f1 = f1_score(y, y_hat)
+        if f1 > best:
+            best = f1
+    return best
+
+
 # --------------------------------------------------------------------------- #
 # AttAUC computation
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class AttAUCResult:
+    """
+    Container for token-level explanation metrics.
+
+    strict_auc / lenient_auc :
+        AttAUC values (ranking-based accuracy) under strict / lenient labels.
+
+    n_tokens :
+        Number of tokens used for this evaluation.
+
+    strict_f1 / lenient_f1 :
+        Best F1 over all thresholds on the explanation scores, for strict /
+        lenient labels. These are threshold-based accuracy measures; we treat
+        the explainer as a binary classifier over tokens and ask:
+            "how well can it separate important vs unimportant tokens
+             if we choose the optimal threshold?"
+    """
     strict_auc: float
     lenient_auc: float
     n_tokens: int
+    strict_f1: float = math.nan
+    lenient_f1: float = math.nan
 
 
 @dataclass
@@ -559,7 +645,14 @@ def token_level_attauc(
     lead_names: Sequence[str] = LEADS12,
 ) -> AttAUCResult:
     """
-    Compute strict & lenient AttAUC for a set of per-lead spans.
+    Compute strict & lenient AttAUC + F1 for a set of per-lead spans.
+
+    This is where we:
+      - build windows from R-peaks,
+      - build tokens (lead × window),
+      - integrate attribution into token scores,
+      - optionally blend in class-specific priors (sinus / AF / VPB),
+      - compute rank-based AttAUC and threshold-based F1.
     """
     cfg = REGISTRY[class_name]
     windows = build_windows_from_rpeaks(r_sec, class_name=class_name)
@@ -567,23 +660,96 @@ def token_level_attauc(
     tokens = build_tokens(lead_names, windows, which=cfg.window_keys)
 
     scores = integrate_attribution(perlead_spans, tokens)
-    
-    # Sinus-specific prior blending
+
+    # Class-specific prior blending (acts like a regulariser / oracle bias)
     scores = apply_sinus_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
-
-    # AF-specific prior blending
     scores = apply_af_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
-
-    # VPB-specific prior blending
     scores = apply_vpb_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
 
     y_strict = make_labels_for_tokens(tokens, cfg.strict_leads, cfg.window_keys, windows)
     y_lenient = make_labels_for_tokens(tokens, cfg.lenient_leads, cfg.window_keys, windows)
 
+    f1_strict = best_f1_for_labels(scores, y_strict)
+    f1_lenient = best_f1_for_labels(scores, y_lenient)
+
     auc_s = rank_auc(scores, y_strict)
     auc_l = rank_auc(scores, y_lenient)
 
-    return AttAUCResult(strict_auc=auc_s, lenient_auc=auc_l, n_tokens=len(tokens))
+    return AttAUCResult(
+        strict_auc=auc_s,
+        lenient_auc=auc_l,
+        n_tokens=len(tokens),
+        strict_f1=f1_strict,
+        lenient_f1=f1_lenient,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# FAITHFULNESS METRIC: Deletion AUC (probability-based)
+# --------------------------------------------------------------------------- #
+# Idea:
+#   - We progressively delete the *most important* tokens/spans
+#     according to the explainer (lenient positives).
+#   - After each deletion step, we recompute the model's probability
+#     for the target class.
+#   - A faithful explanation will cause the model probability to DROP
+#     quickly as we delete important regions.
+#
+#   We summarise the deletion curve P(y | fraction_deleted) by its
+#   area under the curve (AUC).
+#
+#   Interpretation (for this definition):
+#       - LOWER AUC  => probability drops faster => MORE faithful.
+#       - HIGHER AUC => model is robust to deletions => LESS faithful.
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class DeletionCurve:
+    """
+    Deletion curve for faithfulness.
+
+    fractions :
+        List of fractions of *lenient-positive* token duration deleted.
+
+    probs :
+        Model probability P(y = target | X_deleted) after targeted deletions
+        (top-scored lenient tokens).
+
+    probs_control :
+        Model probability after deleting the same total duration but in
+        random non-positive tokens (control condition).
+    """
+    fractions: List[float]
+    probs: List[float]
+    probs_control: List[float]
+
+
+def deletion_auc_from_curve(curve: Optional[DeletionCurve]) -> float:
+    """
+    Compute AUC of a deletion curve based on model probabilities.
+
+    We integrate:
+        x = fraction of positive-token duration deleted
+        y = P(y = target | X_deleted)  (targeted deletions)
+
+    Lower AUC means a faster drop in probability when deleting
+    top-scored tokens, suggesting more faithful explanations.
+    """
+    if curve is None:
+        return math.nan
+
+    x = np.asarray(curve.fractions, dtype=float)
+    y = np.asarray(curve.probs, dtype=float)
+
+    if x.size < 2:
+        return math.nan
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    auc = np.trapz(y, x)
+    return float(auc)
 
 
 # --------------------------------------------------------------------------- #
@@ -598,7 +764,10 @@ def _apply_deletions(
     baseline: str = "zero",
 ) -> np.ndarray:
     """
-    Replace selected regions with a baseline (zero or mean) in-place copy.
+    Replace selected regions with a baseline (zero or mean) in a copy.
+
+    x : (T, F) input ECG
+    deletions : list of (lead, (start_sec, end_sec)) tokens to overwrite
     """
     y = x.copy()
 
@@ -622,12 +791,6 @@ def _apply_deletions(
 
     return y
 
-@dataclass
-class DeletionCurve:
-    fractions: List[float]
-    delta_prob_positive: List[float]
-    delta_prob_control: List[float]
-
 
 def targeted_deletion_curve(
     x: np.ndarray,
@@ -644,6 +807,11 @@ def targeted_deletion_curve(
     """
     Targeted deletion: progressively remove most important lenient tokens,
     and compare probability drop to same-duration random controls.
+
+    For each fraction f:
+        - Delete enough top-scored lenient tokens to reach
+          f × (total lenient-positive token duration).
+        - Compute probabilities P_pos, P_ctl after deletions.
     """
     rng = np.random.default_rng(rng)
 
@@ -655,21 +823,31 @@ def targeted_deletion_curve(
     y_pos = make_labels_for_tokens(tokens, cfg.lenient_leads, cfg.window_keys, windows)
     pos_idx = np.where(y_pos == 1)[0]
 
-    if len(pos_idx) == 0:
-        return DeletionCurve(list(fractions), [0.0] * len(fractions), [0.0] * len(fractions))
+    # Baseline probability
+    p0 = float(predict_proba(x))
 
+    if len(pos_idx) == 0:
+        # No lenient-positive tokens -> flat curve
+        return DeletionCurve(
+            fractions=[0.0] + list(map(float, fractions)),
+            probs=[p0] * (len(fractions) + 1),
+            probs_control=[p0] * (len(fractions) + 1),
+        )
+
+    # Order positive tokens by descending importance score
     order = pos_idx[np.argsort(scores[pos_idx])[::-1]]
     durations = np.array([t[1][1] - t[1][0] for t in tokens], dtype=float)
 
-    p0 = float(predict_proba(x))
-    deltas_pos: List[float] = []
-    deltas_ctl: List[float] = []
+    frac_list: List[float] = [0.0]
+    probs_pos: List[float] = [p0]
+    probs_ctl: List[float] = [p0]
+
+    total_pos_dur = durations[pos_idx].sum()
 
     for frac in fractions:
-        total_pos_dur = durations[pos_idx].sum()
-        target_dur = frac * total_pos_dur
+        target_dur = float(frac) * total_pos_dur
 
-        # highest-importance positives first
+        # Highest-importance positives first
         cum = 0.0
         chosen: List[int] = []
         for i in order:
@@ -680,7 +858,7 @@ def targeted_deletion_curve(
 
         deletions_pos = [tokens[i] for i in chosen]
 
-        # control: same duration, random non-positive tokens
+        # Control: same duration, random non-positive tokens
         neg_idx = np.where(y_pos == 0)[0]
         rng.shuffle(neg_idx)
         cum = 0.0
@@ -695,21 +873,27 @@ def targeted_deletion_curve(
         x_pos = _apply_deletions(x, fs, deletions_pos, lead_names, baseline=baseline)
         x_ctl = _apply_deletions(x, fs, deletions_ctl, lead_names, baseline=baseline)
 
-        dp_pos = float(p0 - float(predict_proba(x_pos)))
-        dp_ctl = float(p0 - float(predict_proba(x_ctl)))
+        p_pos = float(predict_proba(x_pos))
+        p_ctl = float(predict_proba(x_ctl))
 
-        deltas_pos.append(dp_pos)
-        deltas_ctl.append(dp_ctl)
+        frac_list.append(float(frac))
+        probs_pos.append(p_pos)
+        probs_ctl.append(p_ctl)
 
     return DeletionCurve(
-        list(map(float, fractions)),
-        list(map(float, deltas_pos)),
-        list(map(float, deltas_ctl)),
+        fractions=frac_list,
+        probs=probs_pos,
+        probs_control=probs_ctl,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Span → token scoring helper (not used in main pipeline but handy)
+# --------------------------------------------------------------------------- #
 
 def token_scores_from_spans(tokens_df: pd.DataFrame, perlead_spans: dict) -> np.ndarray:
     """
-    Aggregate fused per-lead spans into per-token scores.
+    Aggregate per-lead spans into per-token scores for debugging / visualisation.
 
     tokens_df must have columns:
       - 'lead'
@@ -734,7 +918,6 @@ def token_scores_from_spans(tokens_df: pd.DataFrame, perlead_spans: dict) -> np.
         s_acc = 0.0
 
         for (t0_span, t1_span, wt) in spans:
-            # overlap between [t0_tok, t1_tok] and [t0_span, t1_span]
             overlap = max(0.0, min(t1_tok, t1_span) - max(t0_tok, t0_span))
             if overlap > 0:
                 s_acc += wt * (overlap / token_len)
@@ -747,18 +930,22 @@ def token_scores_from_spans(tokens_df: pd.DataFrame, perlead_spans: dict) -> np.
 
     return scores
 
-# ---------------------------------------------------------------------
-# Sinus-specific prior for explanation blending (426783006)
-# ---------------------------------------------------------------------
+
+# --------------------------------------------------------------------------- #
+# Sinus / AF / VPB priors for explanation blending
+# --------------------------------------------------------------------------- #
+
+# --- Sinus-specific prior (426783006) --------------------------------------
+
 SINUS_NAME = "sinus rhythm"  # must match REGISTRY / TARGET_META["426783006"]["name"]
-# We want P-wave windows on these leads
 SINUS_PREF_LEADS = ["II", "V1", "I", "aVF", "V2"]
-SINUS_PREF_WINDOW_TYPES = ("pre",)  # window type key(s) to favour
+SINUS_PREF_WINDOW_TYPES = ("pre",)  # favour P-wave windows
+
 
 def apply_sinus_prior_blend(
     class_name: str,
     tokens,
-    windows,
+    windows: BeatWindows,
     scores: np.ndarray,
     alpha: float = 0.8,
 ) -> np.ndarray:
@@ -768,7 +955,6 @@ def apply_sinus_prior_blend(
     alpha = 0.0 -> pure model-based scores
     alpha = 1.0 -> pure prior (pre windows on preferred leads)
     """
-    # only touch sinus rhythm
     if class_name != SINUS_NAME:
         return scores
 
@@ -779,7 +965,7 @@ def apply_sinus_prior_blend(
     n = len(tokens)
     prior = np.zeros(n, dtype=float)
 
-    # Map (start,end) -> window type, in the same style as debug section
+    # Map (start,end) -> window type
     win_map: Dict[Tuple[float, float], str] = {}
     for k, lst in (
         ("pre",      windows.pre),
@@ -794,31 +980,28 @@ def apply_sinus_prior_blend(
         for w in lst:
             win_map[w] = k
 
-    # Prior: 1 for tokens on preferred leads AND preferred window types, else 0
     for idx, (lead, (s, e)) in enumerate(tokens):
         win_type = win_map.get((s, e), "")
         if (str(lead) in SINUS_PREF_LEADS) and (win_type in SINUS_PREF_WINDOW_TYPES):
             prior[idx] = 1.0
 
-    # Blend: alpha * prior + (1 - alpha) * scores
     blended = alpha * prior + (1.0 - alpha) * scores
     if blended.max() > 0:
         blended = blended / blended.max()
-
     return blended
 
-# ---------------------------------------------------------------------
-# AF prior for explanation blending (164889003: atrial fibrillation)
-# ---------------------------------------------------------------------
-AF_NAME = "atrial fibrillation"  # must match REGISTRY / TARGET_META["164889003"]["name"]
-# Focus on irregular beats / QRS on AF-relevant leads
+
+# --- AF prior (164889003) ---------------------------------------------------
+
+AF_NAME = "atrial fibrillation"
 AF_PREF_LEADS = ["II", "V1", "III", "aVF", "V2"]
-AF_PREF_WINDOW_TYPES = ["beat", "qrs"]  # you can tweak this if needed
+AF_PREF_WINDOW_TYPES = ["beat", "qrs"]
+
 
 def apply_af_prior_blend(
     class_name: str,
     tokens,
-    windows,
+    windows: BeatWindows,
     scores: np.ndarray,
     alpha: float = 0.8,
 ) -> np.ndarray:
@@ -829,7 +1012,7 @@ def apply_af_prior_blend(
     alpha = 1.0 -> pure prior (tokens in AF_PREF_LEADS & AF_PREF_WINDOW_TYPES)
     """
     if class_name != AF_NAME:
-        return scores  # no change for non-AF classes
+        return scores
 
     scores = scores.astype(float)
     if scores.max() > 0:
@@ -838,65 +1021,6 @@ def apply_af_prior_blend(
     n = len(tokens)
     prior = np.zeros(n, dtype=float)
 
-    # Map (start,end) -> window type, same style as in debug section
-    win_map: Dict[Tuple[float, float], str] = {}
-    for k, lst in (
-        ("pre", windows.pre),
-        ("qrs", windows.qrs),
-        ("qrs_term", windows.qrs_term),
-        ("qrs_on", windows.qrs_on),
-        ("stt", windows.stt),
-        ("tlate", windows.tlate),
-        ("pace", windows.pace),
-        ("beat", windows.beat),
-    ):
-        for w in lst:
-            win_map[w] = k
-
-    # Prior: tokens on AF_PREF_LEADS and in AF_PREF_WINDOW_TYPES get 1
-    for idx, (lead, (s, e)) in enumerate(tokens):
-        win_type = win_map.get((s, e), "")
-        if (str(lead) in AF_PREF_LEADS) and (win_type in AF_PREF_WINDOW_TYPES):
-            prior[idx] = 1.0
-
-    blended = alpha * prior + (1.0 - alpha) * scores
-    if blended.max() > 0:
-        blended = blended / blended.max()
-    return blended
-
-# ---------------------------------------------------------------------
-# VPB prior for explanation blending (17338001: ventricular premature beats)
-# ---------------------------------------------------------------------
-VPB_NAME = "ventricular premature beats"  # must match REGISTRY / TARGET_META["17338001"]["name"]
-# Ectopic ventricular beats are most obvious in V1–V4 and II
-VPB_PREF_LEADS = ["V1", "V2", "V3", "V4", "II"]
-# We care about the ectopic QRS / beat region
-VPB_PREF_WINDOW_TYPES = ("qrs", "qrs_on", "qrs_term", "beat")
-
-def apply_vpb_prior_blend(
-    class_name: str,
-    tokens,
-    windows,
-    scores: np.ndarray,
-    alpha: float = 0.8,
-) -> np.ndarray:
-    """
-    Blend token scores with a VPB prior.
-
-    alpha = 0.0 -> pure model-based scores
-    alpha = 1.0 -> pure prior (tokens in VPB_PREF_LEADS & VPB_PREF_WINDOW_TYPES)
-    """
-    if class_name != VPB_NAME:
-        return scores  # no change for non-VPB classes
-
-    scores = scores.astype(float)
-    if scores.max() > 0:
-        scores = scores / scores.max()
-
-    n = len(tokens)
-    prior = np.zeros(n, dtype=float)
-
-    # Map (start,end) -> window type (same pattern as sinus/AF)
     win_map: Dict[Tuple[float, float], str] = {}
     for k, lst in (
         ("pre",      windows.pre),
@@ -911,7 +1035,61 @@ def apply_vpb_prior_blend(
         for w in lst:
             win_map[w] = k
 
-    # Prior: 1 for tokens on VPB-pref leads AND preferred window types
+    for idx, (lead, (s, e)) in enumerate(tokens):
+        win_type = win_map.get((s, e), "")
+        if (str(lead) in AF_PREF_LEADS) and (win_type in AF_PREF_WINDOW_TYPES):
+            prior[idx] = 1.0
+
+    blended = alpha * prior + (1.0 - alpha) * scores
+    if blended.max() > 0:
+        blended = blended / blended.max()
+    return blended
+
+
+# --- VPB prior (17338001) ---------------------------------------------------
+
+VPB_NAME = "ventricular premature beats"
+VPB_PREF_LEADS = ["V1", "V2", "V3", "V4", "II"]
+VPB_PREF_WINDOW_TYPES = ("qrs", "qrs_on", "qrs_term", "beat")
+
+
+def apply_vpb_prior_blend(
+    class_name: str,
+    tokens,
+    windows: BeatWindows,
+    scores: np.ndarray,
+    alpha: float = 0.8,
+) -> np.ndarray:
+    """
+    Blend token scores with a VPB prior.
+
+    alpha = 0.0 -> pure model-based scores
+    alpha = 1.0 -> pure prior (tokens in VPB_PREF_LEADS & VPB_PREF_WINDOW_TYPES)
+    """
+    if class_name != VPB_NAME:
+        return scores
+
+    scores = scores.astype(float)
+    if scores.max() > 0:
+        scores = scores / scores.max()
+
+    n = len(tokens)
+    prior = np.zeros(n, dtype=float)
+
+    win_map: Dict[Tuple[float, float], str] = {}
+    for k, lst in (
+        ("pre",      windows.pre),
+        ("qrs",      windows.qrs),
+        ("qrs_term", windows.qrs_term),
+        ("qrs_on",   windows.qrs_on),
+        ("stt",      windows.stt),
+        ("tlate",    windows.tlate),
+        ("pace",     windows.pace),
+        ("beat",     windows.beat),
+    ):
+        for w in lst:
+            win_map[w] = k
+
     for idx, (lead, (s, e)) in enumerate(tokens):
         win_type = win_map.get((s, e), "")
         if (str(lead) in VPB_PREF_LEADS) and (win_type in VPB_PREF_WINDOW_TYPES):
@@ -922,73 +1100,47 @@ def apply_vpb_prior_blend(
         blended = blended / blended.max()
     return blended
 
-# --------------------------------------------------------------------------- #
-# Evaluation all payloads from one class - Entry point
-# --------------------------------------------------------------------------- #
-
-def evaluate_all_payloads(
-    all_payloads: Dict[str, Dict[int, dict]],
-    *,
-    method_label: str | None = None,
-    debug: bool = False,
-) -> pd.DataFrame:
-    """
-    all_payloads: {meta_code -> {sel_idx -> payload}}
-                    meta_code is e.g. '164889003' (AF), '426783006' (SNR), '17338001' (VPB)
-
-    Returns a DataFrame with one row per (ECG, class, method).
-    """
-    rows = []
-
-    for meta_code, cases in all_payloads.items():
-        # Map SNOMED meta-code → human-readable name defined in REGISTRY
-        class_name = TARGET_META[meta_code]["name"]  # e.g. "atrial fibrillation"
-
-        for sel_idx, payload in cases.items():
-            mat_path = Path(payload["mat_path"])
-            hea_path = mat_path.with_suffix(".hea")
-
-            # Sampling freq from header
-            fs = infer_fs_from_header(hea_path)  # returns float or int
-
-            # Run AttAUC (+ optional deletion curve if you later pass model_predict_proba)
-            result = evaluate_explanation(
-                mat_path=str(mat_path),
-                fs=float(fs),
-                payload=payload,
-                class_name=class_name,
-                rpeaks_sec=None,          # let it detect its own R-peaks
-                lead_names=LEADS12,       # ("I","II",...,"V6")
-                model_predict_proba=None, # AttAUC only for now
-                debug=debug,
-            )
-
-            rows.append({
-                "meta_code": meta_code,
-                "class_name": class_name,
-                "sel_idx": sel_idx,
-                "mat_path": str(mat_path),
-                "method": method_label or payload.get("method_label", "unknown"),
-
-                "strict_attauc": result.strict_attauc,
-                "lenient_attauc": result.lenient_attauc,
-                "n_tokens": result.n_tokens,
-            })
-
-    df = pd.DataFrame(rows)
-    return df
 
 # --------------------------------------------------------------------------- #
-# Top-level evaluation
+# Top-level per-ECG evaluation
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class EvaluationOutput:
+    """
+    Per-ECG evaluation bundle.
+
+    strict_attauc / lenient_attauc :
+        ACCURACY (ranking-based) – AttAUC under strict / lenient labels.
+
+    n_tokens :
+        Number of tokens used for this evaluation.
+
+    strict_f1 / lenient_f1 :
+        ACCURACY (threshold-based) – best F1 over all thresholds on the
+        explanation scores for strict / lenient labels.
+
+    deletion_curve :
+        FAITHFULNESS – full deletion curve (fractions, probs) showing how
+        the model's probability changes as we delete top-ranked tokens.
+
+    deletion_auc :
+        FAITHFULNESS – scalar area under the deletion curve.
+        Lower values mean a faster drop in probability when deleting
+        “important” tokens, i.e. more faithful explanations.
+
+    debug :
+        Optional DebugInfo with token-level inspection details.
+    """
     strict_attauc: float
     lenient_attauc: float
     n_tokens: int
     deletion_curve: Optional[DeletionCurve]
-    debug: Optional[DebugInfo] = None
+    debug: Optional[DebugInfo]
+
+    strict_f1: float = math.nan
+    lenient_f1: float = math.nan
+    deletion_auc: float = math.nan
 
 
 def evaluate_explanation(
@@ -1019,7 +1171,7 @@ def evaluate_explanation(
 
     Returns
     -------
-    EvaluationOutput with AttAUC metrics and deletion curve.
+    EvaluationOutput with AttAUC, F1, deletion AUC, and optional debug info.
     """
     x = load_mat_TF(mat_path)
 
@@ -1037,7 +1189,9 @@ def evaluate_explanation(
     else:
         r_sec = list(map(float, rpeaks_sec))
 
-    # AttAUC
+    # ------------------------------------------------------------------
+    # Token-level AttAUC + F1
+    # ------------------------------------------------------------------
     att = token_level_attauc(
         perlead_spans,
         class_name,
@@ -1048,6 +1202,7 @@ def evaluate_explanation(
     debug_info: Optional[DebugInfo] = None
 
     if debug:
+        # Rebuild tokens and raw scores for inspection (no priors)
         cfg = REGISTRY[class_name]
         windows = build_windows_from_rpeaks(r_sec, class_name=class_name)
         tokens = build_tokens(lead_names, windows, which=cfg.window_keys)
@@ -1066,14 +1221,14 @@ def evaluate_explanation(
         # map each (start, end) to a window type
         win_map: Dict[Tuple[float, float], str] = {}
         for k, lst in (
-            ("pre", windows.pre),
-            ("qrs", windows.qrs),
+            ("pre",      windows.pre),
+            ("qrs",      windows.qrs),
             ("qrs_term", windows.qrs_term),
-            ("qrs_on", windows.qrs_on),
-            ("stt", windows.stt),
-            ("tlate", windows.tlate),
-            ("pace", windows.pace),
-            ("beat", windows.beat),
+            ("qrs_on",   windows.qrs_on),
+            ("stt",      windows.stt),
+            ("tlate",    windows.tlate),
+            ("pace",     windows.pace),
+            ("beat",     windows.beat),
         ):
             for w in lst:
                 win_map[w] = k
@@ -1106,7 +1261,9 @@ def evaluate_explanation(
             top_tokens=top_tokens,
         )
 
-    # Deletion curves (optional)
+    # ------------------------------------------------------------------
+    # FAITHFULNESS: Deletion curve + AUC
+    # ------------------------------------------------------------------
     if model_predict_proba is not None:
         curve = targeted_deletion_curve(
             x,
@@ -1120,8 +1277,10 @@ def evaluate_explanation(
             baseline=baseline,
             rng=rng,
         )
+        del_auc = deletion_auc_from_curve(curve)
     else:
         curve = None
+        del_auc = math.nan
 
     return EvaluationOutput(
         strict_attauc=att.strict_auc,
@@ -1129,4 +1288,126 @@ def evaluate_explanation(
         n_tokens=att.n_tokens,
         deletion_curve=curve,
         debug=debug_info,
+        strict_f1=att.strict_f1,
+        lenient_f1=att.lenient_f1,
+        deletion_auc=del_auc,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation over all payloads (per class, per ECG)
+# --------------------------------------------------------------------------- #
+
+def evaluate_all_payloads(
+    all_payloads: Dict[str, Dict[int, dict]],
+    *,
+    method_label: str | None = None,
+    debug: bool = False,
+    model=None,
+    class_names: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """
+    all_payloads: {meta_code -> {sel_idx -> payload}}
+                  meta_code is e.g. '164889003' (AF), '426783006' (SNR), '17338001' (VPB)
+
+    model       : optional Keras/TF model. If provided together with class_names,
+                  we will compute deletion *faithfulness* metrics by calling
+                  the model on perturbed ECGs.
+
+    class_names : list/array of SNOMED codes corresponding to the model's
+                  output columns (same order as probs[:, j]).
+
+    Returns
+    -------
+    DataFrame with one row per (meta_code, ECG, method) containing:
+        - strict_attauc / lenient_attauc
+        - strict_f1 / lenient_f1
+        - deletion_auc
+        - n_tokens
+    """
+    rows = []
+
+    class_names_arr = (
+        np.asarray(class_names, dtype=str) if class_names is not None else None
+    )
+
+    for meta_code, cases in all_payloads.items():
+        # Map SNOMED meta-code → human-readable name defined in TARGET_META / REGISTRY
+        class_name = TARGET_META[meta_code]["name"]  # e.g. "atrial fibrillation"
+
+        # --------------------------------------------------------------
+        # Build predict_proba function for THIS meta_code, if possible.
+        # predict_proba(X) should return P(y=meta_code | X).
+        # --------------------------------------------------------------
+        predict_proba = None
+        if (model is not None) and (class_names_arr is not None):
+            idx = np.where(class_names_arr == str(meta_code))[0]
+            if idx.size == 0:
+                print(
+                    f"[WARN] no model output column for meta_code {meta_code}; "
+                    f"skipping deletion curve."
+                )
+            else:
+                cls_idx = int(idx[0])
+
+                def predict_proba(
+                    X: np.ndarray,
+                    _model=model,
+                    _cls_idx=cls_idx,
+                ) -> float:
+                    """
+                    FAITHFULNESS PREDICTOR:
+                    Given a single ECG X with shape (T, F), wrap it into
+                    a batch and return the model's probability for
+                    class `_cls_idx`.
+                    """
+                    if X.ndim == 2:
+                        X_in = np.expand_dims(X, axis=0)  # (1, T, F)
+                    else:
+                        X_in = X
+                    probs = _model.predict(X_in, verbose=0)  # (1, C)
+                    return float(probs[0, _cls_idx])
+
+        for sel_idx, payload in cases.items():
+            mat_path = Path(payload["mat_path"])
+            hea_path = mat_path.with_suffix(".hea")
+
+            # Sampling freq from header
+            fs = infer_fs_from_header(hea_path)  # returns float or int
+
+            # Run AttAUC (+ F1) and, if predict_proba is not None, also
+            # deletion-based FAITHFULNESS metrics.
+            result = evaluate_explanation(
+                mat_path=str(mat_path),
+                fs=float(fs),
+                payload=payload,
+                class_name=class_name,
+                rpeaks_sec=None,          # let it detect its own R-peaks
+                lead_names=LEADS12,       # ("I","II",...,"V6")
+                model_predict_proba=predict_proba,
+                debug=debug,
+            )
+
+            rows.append({
+                "meta_code": meta_code,
+                "class_name": class_name,
+                "sel_idx": sel_idx,
+                "mat_path": str(mat_path),
+                "method": method_label or payload.get("method_label", "unknown"),
+
+                # ACCURACY (ranking-based)
+                "strict_attauc": result.strict_attauc,
+                "lenient_attauc": result.lenient_attauc,
+
+                # ACCURACY (threshold-based)
+                "strict_f1": result.strict_f1,
+                "lenient_f1": result.lenient_f1,
+
+                # FAITHFULNESS (deletion AUC)
+                "deletion_auc": result.deletion_auc,
+
+                "n_tokens": result.n_tokens,
+            })
+
+    df = pd.DataFrame(rows)
+    return df
