@@ -9,7 +9,6 @@ from preprocessing import infer_fs_from_header
 from payload import _infer_fs_from_header_lines
 from utils import load_physionet_data
 
-
 LIMB   = ["I","II","III","aVR","aVL","aVF"]
 VLEADS = ["V1","V2","V3","V4","V5","V6"]
 DEFAULT_LEADS = LIMB + VLEADS
@@ -19,7 +18,6 @@ LEAD_COLOR = {
     "V1":"#A64D79","V2":"#6AA84F","V3":"#BF9000",
     "V4":"#3D85C6","V5":"#45818E","V6":"#741B47"
 }
-
 
 def _read_header_lines(hea_path):
     if not os.path.exists(hea_path):
