@@ -196,7 +196,6 @@ def _median_hr_bpm(r_sec: Sequence[float]) -> float:
         return 70.0
     return float(60.0 / np.median(rr))
 
-
 def build_windows_from_rpeaks(
     r_sec: Sequence[float],
     *,
@@ -245,6 +244,91 @@ def build_windows_from_rpeaks(
         beat.append((r - 0.30,         r + 0.40))
 
     return BeatWindows(pre, qrs, qrs_term, qrs_on, stt, tlate, pace, beat)
+
+
+def _build_window_type_map(windows: BeatWindows) -> Dict[Tuple[float, float], str]:
+    """
+    Utility: map each (start_sec, end_sec) interval to its window type key:
+        'pre', 'qrs', 'qrs_term', 'qrs_on', 'stt', 'tlate', 'pace', 'beat'.
+
+    This lets us recover the window family for any token.
+    """
+    win_map: Dict[Tuple[float, float], str] = {}
+    for k, lst in (
+        ("pre",      windows.pre),
+        ("qrs",      windows.qrs),
+        ("qrs_term", windows.qrs_term),
+        ("qrs_on",   windows.qrs_on),
+        ("stt",      windows.stt),
+        ("tlate",    windows.tlate),
+        ("pace",     windows.pace),
+        ("beat",     windows.beat),
+    ):
+        for w in lst:
+            win_map[w] = k
+    return win_map
+
+
+def aggregate_scores_by_region(
+    tokens: List[Tuple[str, Tuple[float, float]]],
+    windows: BeatWindows,
+    r_sec: Sequence[float],
+    scores: np.ndarray,
+) -> Tuple[List[Tuple[str, str, int]], np.ndarray]:
+    """
+    Aggregate token scores into *physiologic regions*.
+
+    Region key:
+        (lead, window_type, beat_index)
+
+    - lead        : "I", "II", "V1", ...
+    - window_type : "pre", "qrs", "qrs_term", ...
+    - beat_index  : index of nearest R-peak to the token centre.
+
+    This reduces sensitivity to tiny shifts of importance between
+    neighbouring tokens around the same beat and window.
+
+    Returns
+    -------
+    region_keys : list of (lead, window_type, beat_index)
+    region_scores : np.ndarray of aggregated scores (mean per region)
+    """
+    scores = np.asarray(scores, dtype=float)
+    win_map = _build_window_type_map(windows)
+    r_sec_arr = np.asarray(r_sec, dtype=float)
+
+    region_to_scores: Dict[Tuple[str, str, int], List[float]] = {}
+
+    for idx, (lead, (s, e)) in enumerate(tokens):
+        # Recover window type (pre/qrs/...)
+        win_type = win_map.get((s, e), None)
+        if win_type is None:
+            continue
+
+        # Centre of this token in time
+        centre = 0.5 * (float(s) + float(e))
+
+        # Assign to nearest R-peak -> beat index
+        if r_sec_arr.size == 0:
+            beat_idx = 0
+        else:
+            beat_idx = int(np.argmin(np.abs(r_sec_arr - centre)))
+
+        key = (str(lead), str(win_type), beat_idx)
+        region_to_scores.setdefault(key, []).append(float(scores[idx]))
+
+    # Aggregate (mean) per region
+    region_keys: List[Tuple[str, str, int]] = sorted(region_to_scores.keys())
+    region_scores = np.array(
+        [np.mean(region_to_scores[k]) for k in region_keys],
+        dtype=float,
+    )
+
+    # Normalise for stability of scale (optional but nice)
+    if region_scores.size > 0 and region_scores.max() > 0:
+        region_scores = region_scores / region_scores.max()
+
+    return region_keys, region_scores
 
 
 # --------------------------------------------------------------------------- #
@@ -683,6 +767,272 @@ def token_level_attauc(
         lenient_f1=f1_lenient,
     )
 
+def compute_token_scores_and_labels(
+    mat_path: str,
+    fs: float,
+    payload: Dict,
+    class_name: str,
+    lead_names: Sequence[str] = LEADS12,
+) -> Tuple[
+    List[Tuple[str, Tuple[float, float]]],  # tokens
+    np.ndarray,                             # scores (after priors)
+    np.ndarray,                             # y_strict
+    np.ndarray,                             # y_lenient
+]:
+    """
+    Utility for stability/consistency analysis.
+
+    For a single ECG + explanation payload, compute:
+
+        - tokens  : list[(lead, (t_start, t_end))]
+        - scores  : attribution score per token (after sinus/AF/VPB priors)
+        - y_strict: 0/1 token labels under strict config
+        - y_lenient: 0/1 token labels under lenient config
+
+    This mirrors the internals of `token_level_attauc`, but exposes the
+    actual vectors so you can compare multiple explanations for the
+    same ECG.
+
+    Metrics:
+        - These are used for ACCURACY (via labels) and STABILITY
+            (comparing scores across methods/seeds).
+    """
+    x = load_mat_TF(mat_path)
+
+    # per-lead spans: {lead -> [(s, e, w), ...]} in seconds
+    raw_spans = payload.get("perlead_spans", {})
+    perlead_spans = {
+        str(L): [(float(s), float(e), float(w)) for (s, e, w) in spans]
+        for L, spans in raw_spans.items()
+    }
+
+    # R-peaks
+    r_idx = detect_rpeaks(x, fs, prefer=("II", "V2", "V3"), lead_names=lead_names)
+    r_sec = (r_idx / float(fs)).tolist()
+
+    cfg = REGISTRY[class_name]
+    windows = build_windows_from_rpeaks(r_sec, class_name=class_name)
+
+    # Build tokens and raw scores
+    tokens = build_tokens(lead_names, windows, which=cfg.window_keys)
+    scores = integrate_attribution(perlead_spans, tokens)
+
+    # Apply any class-specific priors (sinus, AF, VPB)
+    scores = apply_sinus_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
+    scores = apply_af_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
+    scores = apply_vpb_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
+
+    # Labels for accuracy metrics
+    y_strict = make_labels_for_tokens(tokens, cfg.strict_leads, cfg.window_keys, windows)
+    y_lenient = make_labels_for_tokens(tokens, cfg.lenient_leads, cfg.window_keys, windows)
+
+    return tokens, scores, y_strict, y_lenient
+
+
+def _ranks_with_ties(values: np.ndarray) -> np.ndarray:
+    """
+    Compute ranks for Spearman correlation, averaging over ties.
+
+    Used for STABILITY metrics (Spearman correlation of explanation scores).
+    """
+    values = np.asarray(values, dtype=float)
+    n = values.size
+    order = np.argsort(values)
+    ranks = np.empty(n, dtype=float)
+    ranks[order] = np.arange(1, n + 1, dtype=float)
+
+    # tie correction: average ranks for equal values
+    unique_vals = np.unique(values)
+    for v in unique_vals:
+        idx = np.where(values == v)[0]
+        if idx.size > 1:
+            ranks[idx] = ranks[idx].mean()
+    return ranks
+
+def explanation_stability(
+    scores_a: np.ndarray,
+    scores_b: np.ndarray,
+    *,
+    k: int | None = 20,
+) -> Dict[str, float]:
+    """
+    STABILITY / CONSISTENCY metrics between two explanations
+    for the *same tokens* (same ECG, same tokenisation).
+
+    Inputs
+    ------
+    scores_a, scores_b : arrays of length N
+        Token scores from explanation A and B, in the SAME order.
+
+    k : int or None
+        If given, we compute Jaccard similarity of the top-K tokens.
+        If None, Jaccard@K is omitted.
+
+    Returns
+    -------
+    dict with:
+        - 'spearman': Spearman rank correlation of scores
+                        (1.0 = identical ranking, 0 ≈ random, -1 = reversed)
+        - 'jaccard_topk': Jaccard similarity of top-K token sets
+                        (1.0 = identical, 0 = disjoint), or NaN if k is None
+    """
+    import math
+
+    s1 = np.asarray(scores_a, dtype=float)
+    s2 = np.asarray(scores_b, dtype=float)
+
+    if s1.shape != s2.shape or s1.size == 0:
+        return {"spearman": math.nan, "jaccard_topk": math.nan}
+
+    # --- Spearman rank correlation (STABILITY of ranking) ---
+    r1 = _ranks_with_ties(s1)
+    r2 = _ranks_with_ties(s2)
+
+    # Pearson on ranks
+    r1c = r1 - r1.mean()
+    r2c = r2 - r2.mean()
+    denom = (np.linalg.norm(r1c) * np.linalg.norm(r2c))
+    if denom == 0:
+        spearman = math.nan
+    else:
+        spearman = float(np.dot(r1c, r2c) / denom)
+
+    # --- Jaccard similarity of top-K tokens (STABILITY of selected regions) ---
+    if k is None or k <= 0 or k > s1.size:
+        jacc = math.nan
+    else:
+        idx1 = np.argsort(s1)[::-1][:k]
+        idx2 = np.argsort(s2)[::-1][:k]
+        set1 = set(idx1.tolist())
+        set2 = set(idx2.tolist())
+        inter = len(set1 & set2)
+        union = len(set1 | set2)
+        jacc = float(inter / union) if union > 0 else math.nan
+
+    return {
+        "spearman": spearman,
+        "jaccard_topk": jacc,
+    }
+
+def stability_between_payloads(
+    mat_path: str,
+    fs: float,
+    payload_a: Dict,
+    payload_b: Dict,
+    class_name: str,
+    lead_names: Sequence[str] = LEADS12,
+    k: int = 20,
+) -> Dict[str, float]:
+    """
+    High-level STABILITY metric between two explanations for the same ECG.
+
+    Typical use-cases:
+        - same model, different seeds
+        - same model, different explainer hyperparameters
+        - different explanation methods (e.g. LIME vs TimeSHAP)
+
+    It will:
+        1) Recompute tokens + scores for each payload
+        2) Check tokens are the same (same ECG + same tokenisation)
+        3) Return Spearman + Jaccard@K.
+
+    This does NOT use deletion curves – it only uses token scores.
+    """
+    tokens_a, scores_a, _, _ = compute_token_scores_and_labels(
+        mat_path, fs, payload_a, class_name, lead_names=lead_names
+    )
+    tokens_b, scores_b, _, _ = compute_token_scores_and_labels(
+        mat_path, fs, payload_b, class_name, lead_names=lead_names
+    )
+
+    # Sanity check: tokens must match 1:1 for a sensible comparison
+    if len(tokens_a) != len(tokens_b):
+        raise ValueError("Token lengths differ between explanations.")
+
+    for t1, t2 in zip(tokens_a, tokens_b):
+        if t1 != t2:
+            raise ValueError("Tokens differ between explanations; "
+                                "stability requires identical tokenisation.")
+
+    return explanation_stability(scores_a, scores_b, k=k)
+
+def stability_between_payloads_regionwise(
+    mat_path: str,
+    fs: float,
+    payload_a: Dict,
+    payload_b: Dict,
+    class_name: str,
+    lead_names: Sequence[str] = LEADS12,
+    k: int = 20,
+) -> Dict[str, float]:
+    """
+    STABILITY / CONSISTENCY between two explanations at the *region* level.
+
+    Region = (lead, window_type, beat_index), where:
+      - window_type ∈ {'pre', 'qrs', 'qrs_term', ...}
+      - beat_index is the index of the nearest R-peak to that window.
+
+    Steps:
+      1) Recompute R-peaks and class-specific windows for this ECG.
+      2) Build the same tokenisation (lead × window) for both explanations.
+      3) Turn per-token scores into per-region scores (aggregate by mean).
+      4) Compute stability metrics on the region scores:
+           - Spearman (rank stability over regions)
+           - Jaccard@K (overlap of top-K regions).
+
+    This is less sensitive to tiny shifts between neighbouring tokens
+    around the same beat and typically gives a higher Jaccard@K while
+    still being physiologically meaningful.
+    """
+    # --- Load ECG + R-peaks ---
+    x = load_mat_TF(mat_path)
+    r_idx = detect_rpeaks(x, fs, prefer=("II", "V2", "V3"), lead_names=lead_names)
+    r_sec = (r_idx / float(fs)).tolist()
+
+    # --- Build class-specific windows & tokens (shared for both payloads) ---
+    cfg = REGISTRY[class_name]
+    windows = build_windows_from_rpeaks(r_sec, class_name=class_name)
+    tokens = build_tokens(lead_names, windows, which=cfg.window_keys)
+
+    # --- Per-lead spans for both explanations ---
+    def _spans_from_payload(payload: Dict) -> Dict[str, List[Tuple[float, float, float]]]:
+        raw_spans = payload.get("perlead_spans", {})
+        return {
+            str(L): [(float(s), float(e), float(w)) for (s, e, w) in spans]
+            for L, spans in raw_spans.items()
+        }
+
+    spans_a = _spans_from_payload(payload_a)
+    spans_b = _spans_from_payload(payload_b)
+
+    # --- Token scores (with class priors, same as token_level_attauc) ---
+    scores_a = integrate_attribution(spans_a, tokens)
+    scores_b = integrate_attribution(spans_b, tokens)
+
+    scores_a = apply_sinus_prior_blend(class_name, tokens, windows, scores_a, alpha=0.8)
+    scores_a = apply_af_prior_blend(class_name, tokens, windows, scores_a, alpha=0.8)
+    scores_a = apply_vpb_prior_blend(class_name, tokens, windows, scores_a, alpha=0.8)
+
+    scores_b = apply_sinus_prior_blend(class_name, tokens, windows, scores_b, alpha=0.8)
+    scores_b = apply_af_prior_blend(class_name, tokens, windows, scores_b, alpha=0.8)
+    scores_b = apply_vpb_prior_blend(class_name, tokens, windows, scores_b, alpha=0.8)
+
+    # --- Aggregate to region scores ---
+    keys_a, reg_a = aggregate_scores_by_region(tokens, windows, r_sec, scores_a)
+    keys_b, reg_b = aggregate_scores_by_region(tokens, windows, r_sec, scores_b)
+
+    # Align regions across A and B (some may be empty in one explanation)
+    all_keys = sorted(set(keys_a) | set(keys_b))
+    map_a = {k: v for k, v in zip(keys_a, reg_a)}
+    map_b = {k: v for k, v in zip(keys_b, reg_b)}
+
+    s1 = np.array([map_a.get(k, 0.0) for k in all_keys], dtype=float)
+    s2 = np.array([map_b.get(k, 0.0) for k in all_keys], dtype=float)
+
+    # Reuse your existing stability helper
+    k_eff = min(k, len(all_keys)) if k is not None else None
+    return explanation_stability(s1, s2, k=k_eff)
+
 
 # --------------------------------------------------------------------------- #
 # FAITHFULNESS METRIC: Deletion AUC (probability-based)
@@ -886,6 +1236,56 @@ def targeted_deletion_curve(
         probs_control=probs_ctl,
     )
 
+# --------------------------------------------------------------------- 
+# FAITHFULNESS SUMMARY: gain over random deletion
+# --------------------------------------------------------------------- 
+
+def faithfulness_gain_from_curve(curve: Optional[DeletionCurve]) -> float:
+    """
+    Summarise how much better targeted deletion is than random deletion.
+
+    We use the probabilities stored in the curve:
+
+        curve.probs         : P(y=target | X_deleted) for targeted deletions
+        curve.probs_control : P(y=target | X_deleted) for random deletions
+                                (same total duration removed).
+
+    For each deletion fraction f, we look at the *drop* in probability:
+        Δp_targeted(f) = p0 - p_targeted(f)
+        Δp_random(f)   = p0 - p_random(f)
+
+    Faithfulness gain is then:
+        mean_f [ Δp_targeted(f) - Δp_random(f) ].
+
+    Interpretation:
+        - Higher value  -> targeted deletion hurts the model *more* than random
+                            => MORE faithful.
+        - Near zero     -> targeted ≈ random => explanation behaves like noise.
+        - Negative      -> targeted hurts LESS than random (bad).
+    """
+    if curve is None:
+        return math.nan
+
+    probs_pos = np.asarray(curve.probs, dtype=float)
+    probs_ctl = np.asarray(curve.probs_control, dtype=float)
+
+    if probs_pos.size == 0 or probs_ctl.size == 0:
+        return math.nan
+
+    # Baseline prob (before any deletion) – we stored this at fraction 0
+    p0 = float(probs_pos[0])
+
+    # Drops in probability
+    dp_pos = p0 - probs_pos
+    dp_ctl = p0 - probs_ctl
+
+    # Optionally skip the 0-fraction point (where both drops are 0)
+    if dp_pos.size > 1:
+        diff = (dp_pos[1:] - dp_ctl[1:])
+    else:
+        diff = (dp_pos - dp_ctl)
+
+    return float(diff.mean())
 
 # --------------------------------------------------------------------------- #
 # Span → token scoring helper (not used in main pipeline but handy)
@@ -1141,7 +1541,7 @@ class EvaluationOutput:
     strict_f1: float = math.nan
     lenient_f1: float = math.nan
     deletion_auc: float = math.nan
-
+    faithfulness_gain: float = math.nan
 
 def evaluate_explanation(
     mat_path: str,
@@ -1278,9 +1678,14 @@ def evaluate_explanation(
             rng=rng,
         )
         del_auc = deletion_auc_from_curve(curve)
+
+        # faithfulness gain over random deletion
+        faith_gain = faithfulness_gain_from_curve(curve)
     else:
         curve = None
         del_auc = math.nan
+        faith_gain = math.nan
+
 
     return EvaluationOutput(
         strict_attauc=att.strict_auc,
@@ -1291,6 +1696,7 @@ def evaluate_explanation(
         strict_f1=att.strict_f1,
         lenient_f1=att.lenient_f1,
         deletion_auc=del_auc,
+        faithfulness_gain=faith_gain,
     )
 
 
@@ -1405,6 +1811,7 @@ def evaluate_all_payloads(
 
                 # FAITHFULNESS (deletion AUC)
                 "deletion_auc": result.deletion_auc,
+                "faithfulness_gain": result.faithfulness_gain,
 
                 "n_tokens": result.n_tokens,
             })
