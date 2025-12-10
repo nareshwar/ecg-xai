@@ -23,13 +23,16 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import math
 import numpy as np
 import pandas as pd
-from scipy.io import loadmat
+from scipy.io import loadmat, savemat
 from scipy.signal import butter, filtfilt, find_peaks
 from pathlib import Path
 from sklearn.metrics import f1_score
+from shutil import copyfile
 
-from preprocessing import infer_fs_from_header
+from config import MAXLEN
+from preprocessing import infer_fs_from_header, ensure_paths, parse_fs_and_leads
 from config_targets import TARGET_META
+from explainer import run_fused_pipeline_for_classes
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -169,6 +172,362 @@ def detect_rpeaks(
 
     return np.array(sorted(set(ref)), dtype=int)
 
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from shutil import copyfile
+from scipy.io import savemat
+
+from typing import Sequence, Dict, List, Tuple, Optional
+
+from preprocessing import ensure_paths, parse_fs_and_leads
+from explainer import run_fused_pipeline_for_classes
+from config import MAXLEN
+from config_targets import TARGET_META
+
+
+# -------------------------------------------------------------------
+# 1) Add an extra heartbeat (duplicate beat) to an ECG
+# -------------------------------------------------------------------
+def add_extra_beat(
+    x: np.ndarray,
+    fs: float,
+    *,
+    location: str = "end",
+    beat_index: Optional[int] = None,
+    pre_sec: float = 0.30,
+    post_sec: float = 0.40,
+    lead_names: Sequence[str] = LEADS12,
+    prefer: Sequence[str] = ("II", "V2", "V3"),
+    max_len: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Duplicate one heartbeat and insert it into the ECG.
+
+    location = 'end'    -> append extra beat at end
+    location = 'middle' -> insert extra beat after that beat
+    """
+    x = np.asarray(x, dtype=np.float32)
+    T, F = x.shape
+
+    # --- Detect R-peaks ---
+    r_idx = detect_rpeaks(x, fs, prefer=prefer, lead_names=lead_names)
+    if r_idx.size == 0:
+        raise ValueError("No R-peaks detected; cannot add extra beat.")
+
+    # --- Choose which beat to duplicate ---
+    if beat_index is None:
+        if location == "middle":
+            beat_index = int(len(r_idx) // 2)
+        else:  # default: 'end'
+            beat_index = len(r_idx) - 1
+
+    if not (0 <= beat_index < len(r_idx)):
+        raise IndexError(f"beat_index {beat_index} out of range for {len(r_idx)} beats.")
+
+    r = int(r_idx[beat_index])
+
+    # --- Beat window in samples (≈ BeatWindows.beat: [-0.30, +0.40] s) ---
+    s = max(0, int(round(r - pre_sec * fs)))
+    e = min(T, int(round(r + post_sec * fs)))
+    if e <= s:
+        raise RuntimeError("Computed empty beat segment when extracting heartbeat.")
+
+    beat_seg = x[s:e, :]  # (L, F)
+
+    # --- Decide where to insert ---
+    if location == "middle":
+        insert_at = e
+    else:  # 'end' (append)
+        insert_at = T
+
+    x_new = np.concatenate([x[:insert_at, :], beat_seg, x[insert_at:, :]], axis=0)
+
+    if max_len is not None and x_new.shape[0] > max_len:
+        x_new = x_new[:max_len, :]
+
+    return x_new
+
+
+# -------------------------------------------------------------------
+# 2) Match beats A↔B by R-peak time
+# -------------------------------------------------------------------
+def _match_beats_by_time(
+    r_sec_a: Sequence[float],
+    r_sec_b: Sequence[float],
+    max_diff_sec: float = 0.08,
+) -> List[Tuple[int, int]]:
+    """
+    Greedy 1-to-1 R-peak matching between two recordings.
+    Returns list of (idx_a, idx_b) pairs within max_diff_sec.
+    """
+    r_a = np.asarray(r_sec_a, dtype=float)
+    r_b = np.asarray(r_sec_b, dtype=float)
+
+    pairs: List[Tuple[int, int]] = []
+    used_b = set()
+
+    for i, t in enumerate(r_a):
+        diffs = [
+            (j, abs(float(r_b[j]) - float(t)))
+            for j in range(len(r_b))
+            if j not in used_b
+        ]
+        if not diffs:
+            break
+
+        j, dt = min(diffs, key=lambda p: p[1])
+        if dt <= max_diff_sec:
+            pairs.append((i, j))
+            used_b.add(j)
+
+    return pairs
+
+
+# -------------------------------------------------------------------
+# 3) Stability of fused explanations under extra beat (regionwise)
+# -------------------------------------------------------------------
+def stability_with_extra_beat_regionwise(
+    mat_path_a: str,
+    mat_path_b: str,
+    fs: float,
+    payload_a: Dict,
+    payload_b: Dict,
+    class_name_eval: str,  # e.g. 'sinus rhythm' (matches REGISTRY keys)
+    lead_names: Sequence[str] = LEADS12,
+    k: int = 20,
+    beat_tolerance_sec: float = 0.08,
+) -> Dict[str, float]:
+    """
+    Compare region-level fused explanations between:
+        ECG A  (original)
+        ECG B  (with one extra beat)
+
+    Only uses *matched beats* (by R-peak time), so extra beat is ignored.
+    Returns Spearman and Jaccard@K for aligned regions.
+    """
+    # --- Load ECGs & detect R-peaks ---
+    x_a = load_mat_TF(mat_path_a)
+    x_b = load_mat_TF(mat_path_b)
+
+    r_idx_a = detect_rpeaks(x_a, fs, prefer=("II", "V2", "V3"), lead_names=lead_names)
+    r_idx_b = detect_rpeaks(x_b, fs, prefer=("II", "V2", "V3"), lead_names=lead_names)
+
+    r_sec_a = (r_idx_a / float(fs)).tolist()
+    r_sec_b = (r_idx_b / float(fs)).tolist()
+
+    # --- Class-specific windows & tokens ---
+    cfg = REGISTRY[class_name_eval]
+
+    windows_a = build_windows_from_rpeaks(r_sec_a, class_name=class_name_eval)
+    tokens_a = build_tokens(lead_names, windows_a, which=cfg.window_keys)
+
+    windows_b = build_windows_from_rpeaks(r_sec_b, class_name=class_name_eval)
+    tokens_b = build_tokens(lead_names, windows_b, which=cfg.window_keys)
+
+    def _spans_from_payload(payload: Dict) -> Dict[str, List[Tuple[float, float, float]]]:
+        raw_spans = payload.get("perlead_spans", {})
+        return {
+            str(L): [(float(s), float(e), float(w)) for (s, e, w) in spans]
+            for L, spans in raw_spans.items()
+        }
+
+    spans_a = _spans_from_payload(payload_a)
+    spans_b = _spans_from_payload(payload_b)
+
+    # --- Token scores + priors for A ---
+    scores_a = integrate_attribution(spans_a, tokens_a)
+    scores_a = apply_sinus_prior_blend(class_name_eval, tokens_a, windows_a, scores_a, alpha=0.8)
+    scores_a = apply_af_prior_blend(class_name_eval, tokens_a, windows_a, scores_a, alpha=0.8)
+    scores_a = apply_vpb_prior_blend(class_name_eval, tokens_a, windows_a, scores_a, alpha=0.8)
+    keys_a, reg_a = aggregate_scores_by_region(tokens_a, windows_a, r_sec_a, scores_a)
+
+    # --- Token scores + priors for B ---
+    scores_b = integrate_attribution(spans_b, tokens_b)
+    scores_b = apply_sinus_prior_blend(class_name_eval, tokens_b, windows_b, scores_b, alpha=0.8)
+    scores_b = apply_af_prior_blend(class_name_eval, tokens_b, windows_b, scores_b, alpha=0.8)
+    scores_b = apply_vpb_prior_blend(class_name_eval, tokens_b, windows_b, scores_b, alpha=0.8)
+    keys_b, reg_b = aggregate_scores_by_region(tokens_b, windows_b, r_sec_b, scores_b)
+
+    # --- Match beats by R-peak time (ignore extra beats) ---
+    beat_pairs = _match_beats_by_time(r_sec_a, r_sec_b, max_diff_sec=beat_tolerance_sec)
+    if not beat_pairs:
+        return {"spearman": np.nan, "jaccard_topk": np.nan}
+
+    reg_dict_a = {key: val for key, val in zip(keys_a, reg_a)}
+    reg_dict_b = {key: val for key, val in zip(keys_b, reg_b)}
+
+    leads_present_a = {lead for (lead, win_type, idx) in keys_a}
+    leads_present_b = {lead for (lead, win_type, idx) in keys_b}
+    common_leads = sorted(leads_present_a & leads_present_b)
+
+    win_types_a = {win_type for (lead, win_type, idx) in keys_a}
+    win_types_b = {win_type for (lead, win_type, idx) in keys_b}
+    common_win_types = sorted(win_types_a & win_types_b)
+
+    aligned_a: List[float] = []
+    aligned_b: List[float] = []
+
+    for idx_a, idx_b in beat_pairs:
+        for lead in common_leads:
+            for win_type in common_win_types:
+                key_a = (str(lead), str(win_type), idx_a)
+                key_b = (str(lead), str(win_type), idx_b)
+                if key_a in reg_dict_a and key_b in reg_dict_b:
+                    aligned_a.append(reg_dict_a[key_a])
+                    aligned_b.append(reg_dict_b[key_b])
+
+    if not aligned_a:
+        return {"spearman": np.nan, "jaccard_topk": np.nan}
+
+    s1 = np.asarray(aligned_a, dtype=float)
+    s2 = np.asarray(aligned_b, dtype=float)
+    k_eff = min(k, s1.size) if k is not None else None
+
+    return explanation_stability(s1, s2, k=k_eff)
+
+
+# -------------------------------------------------------------------
+# 4) Make sel_df: original + extra_end + extra_mid
+# -------------------------------------------------------------------
+def make_augmented_sel_df_for_one_record(
+    mat_path: str,
+    class_code: str,
+    fs: float,
+    maxlen: int = MAXLEN,
+) -> pd.DataFrame:
+    """
+    Create:
+      - original MAT
+      - MAT with extra beat at end
+      - MAT with extra beat in middle
+
+    Returns sel_df with 3 rows, with sel_idx = 0,1,2.
+    """
+    x_orig = load_mat_TF(mat_path)
+    x_extra_end = add_extra_beat(x_orig, fs, location="end", max_len=maxlen)
+    x_extra_mid = add_extra_beat(x_orig, fs, location="middle", max_len=maxlen)
+
+    mat_path = Path(mat_path)
+
+    def _save_variant(x_tf: np.ndarray, suffix: str, sel_idx: int) -> Dict:
+        new_mat = mat_path.with_name(mat_path.stem + suffix + mat_path.suffix)
+
+        # PhysioNet-style MAT: val = (n_leads, n_samples)
+        savemat(new_mat, {"val": x_tf.T})
+
+        # copy .hea so metadata is preserved
+        src_hea = mat_path.with_suffix(".hea")
+        dst_hea = new_mat.with_suffix(".hea")
+        if src_hea.exists():
+            copyfile(src_hea, dst_hea)
+
+        return {
+            "group_class": class_code,
+            "filename": str(new_mat),
+            "sel_idx": int(sel_idx),
+        }
+
+    rows = []
+
+    # original
+    rows.append({
+        "group_class": class_code,
+        "filename": str(mat_path),
+        "sel_idx": 0,
+    })
+
+    # extra beat at end
+    rows.append(_save_variant(x_extra_end, "_extra_end", sel_idx=1))
+
+    # extra beat in middle
+    rows.append(_save_variant(x_extra_mid, "_extra_mid", sel_idx=2))
+
+    return pd.DataFrame(rows)
+
+
+# -------------------------------------------------------------------
+# 5) High-level: run fused pipeline + stability for one record
+# -------------------------------------------------------------------
+def run_extra_beat_stability_experiment(
+    mat_path: str,
+    snomed_code: str,
+    model,
+    class_names: Sequence[str],
+    *,
+    maxlen: int = MAXLEN,
+    beat_tolerance_sec: float = 0.08,
+    k: int = 20,
+):
+    """
+    For a single ECG record:
+      - build augmented MATs with an extra heartbeat (end + middle)
+      - run fused LIME+TimeSHAP for this SNOMED class
+      - compute regionwise stability of fused explanations
+    """
+    # --- sampling frequency from header ---
+    hea_path, _ = ensure_paths(mat_path)
+    fs, _ = parse_fs_and_leads(hea_path, default_fs=500.0)
+
+    # --- make sel_df with three versions ---
+    sel_df = make_augmented_sel_df_for_one_record(
+        mat_path=mat_path,
+        class_code=snomed_code,
+        fs=fs,
+        maxlen=maxlen,
+    )
+
+    # --- run fused pipeline ---
+    all_fused_payloads, df_lime_all, df_ts_all = run_fused_pipeline_for_classes(
+        target_classes=[snomed_code],
+        sel_df=sel_df,
+        model=model,
+        class_names=class_names,
+        max_examples_per_class=None,
+        plot=False,
+    )
+
+    fused_for_cls = all_fused_payloads[str(snomed_code)]
+    payload_orig = fused_for_cls[0]          # sel_idx = 0
+    payload_extra_end = fused_for_cls[1]     # sel_idx = 1
+    payload_extra_mid = fused_for_cls[2]     # sel_idx = 2
+
+    # --- paths for augmented MATs ---
+    mat_path_p = Path(mat_path)
+    mat_extra_end = mat_path_p.with_name(mat_path_p.stem + "_extra_end" + mat_path_p.suffix)
+    mat_extra_mid = mat_path_p.with_name(mat_path_p.stem + "_extra_mid" + mat_path_p.suffix)
+
+    # --- map SNOMED -> human name for eval.REGISTRY ---
+    class_name_eval = TARGET_META[str(snomed_code)]["name"]
+
+    metrics_end = stability_with_extra_beat_regionwise(
+        mat_path_a=str(mat_path_p),
+        mat_path_b=str(mat_extra_end),
+        fs=fs,
+        payload_a=payload_orig,
+        payload_b=payload_extra_end,
+        class_name_eval=class_name_eval,
+        k=k,
+        beat_tolerance_sec=beat_tolerance_sec,
+    )
+
+    metrics_mid = stability_with_extra_beat_regionwise(
+        mat_path_a=str(mat_path_p),
+        mat_path_b=str(mat_extra_mid),
+        fs=fs,
+        payload_a=payload_orig,
+        payload_b=payload_extra_mid,
+        class_name_eval=class_name_eval,
+        k=k,
+        beat_tolerance_sec=beat_tolerance_sec,
+    )
+
+    metrics = {
+        "extra_end": metrics_end,
+        "extra_mid": metrics_mid,
+    }
+
+    return metrics, sel_df, all_fused_payloads, df_lime_all, df_ts_all
 
 # --------------------------------------------------------------------------- #
 # HR-aware beat windows

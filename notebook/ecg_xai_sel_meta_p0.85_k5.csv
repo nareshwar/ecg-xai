@@ -1,4 +1,2 @@
 group_class,filename,sel_idx,duration_sec,prob_meta
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR14000.mat,35189,10.0,0.9928524494171143
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR01628.mat,22817,10.0,0.9910366535186768
-426783006,C:\data\ptbxl-electrocardiography-database\WFDB\HR16681.mat,37870,10.0,0.9889710545539856
+164889003,C:\data\china-physiological-signal-challenge-in-2018\Training_WFDB\A0890.mat,4342,10.0,0.9911366105079651
