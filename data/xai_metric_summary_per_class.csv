@@ -1,2 +1,2 @@
 meta_code,class_name,strict_attauc_mean,strict_attauc_std,lenient_attauc_mean,lenient_attauc_std,strict_f1_mean,strict_f1_std,lenient_f1_mean,lenient_f1_std,deletion_auc_mean,deletion_auc_std,n_tokens_mean,n_tokens_std
-164889003,atrial fibrillation,0.9185121107266436,,0.6523032006920415,,0.6451612903225806,,0.8,,0.275050388276577,,204.0,
+164889003,atrial fibrillation,0.9135813148788927,,0.6296496539792388,,0.65625,,0.8,,0.2768227219581604,,204.0,

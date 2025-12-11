@@ -75,8 +75,8 @@ def default_explainer_config(class_name: str) -> Dict[str, object]:
 
     # --- base settings --------------------------------------------------
     window_sec = float(WINDOW_SEC_BY_SNOMED.get(code, BASE_WINDOW_SEC))
-    m_event = 200
-    m_feat = 200
+    m_event = 100
+    m_feat = 100
     mode = "context"
 
     # lead priors (may be None if class not in LEAD_PRIOR_BY_SNOMED)
