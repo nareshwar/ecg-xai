@@ -6,7 +6,7 @@ Provides:
 - REGISTRY: mapping from class name -> which leads/windows are "ground truth"
 - Token-level metrics:
     * AttAUC (strict / lenient)  [ranking-based accuracy]
-    * F1    (strict / lenient)   [threshold-based accuracy]
+    * Precision@K (strict / lenient) [top-K accuracy]
 - Faithfulness metrics:
     * Deletion curve per ECG
     * Deletion AUC (lower = more faithful)
@@ -26,7 +26,6 @@ import pandas as pd
 from scipy.io import loadmat, savemat
 from scipy.signal import butter, filtfilt, find_peaks
 from pathlib import Path
-from sklearn.metrics import f1_score
 from shutil import copyfile
 
 from config import MAXLEN
@@ -42,7 +41,6 @@ LEADS12: Tuple[str, ...] = (
     "I", "II", "III", "aVR", "aVL", "aVF",
     "V1", "V2", "V3", "V4", "V5", "V6"
 )
-
 
 # --------------------------------------------------------------------------- #
 # Basic I/O
@@ -198,6 +196,7 @@ def add_extra_beat(
     pre_sec: float = 0.30,
     post_sec: float = 0.40,
     lead_names: Sequence[str] = LEADS12,
+    precision_k: int = 20,
     prefer: Sequence[str] = ("II", "V2", "V3"),
     max_len: Optional[int] = None,
 ) -> np.ndarray:
@@ -935,7 +934,7 @@ def scores_to_density(
 
 
 # --------------------------------------------------------------------------- #
-# Tokens / labels / F1
+# Tokens / labels / Precision@K
 # --------------------------------------------------------------------------- #
 
 def build_tokens(
@@ -1006,30 +1005,31 @@ def make_labels_for_tokens(
     return labels
 
 
-def best_f1_for_labels(scores: np.ndarray, y: np.ndarray) -> float:
+def precision_at_k(scores: np.ndarray, y: np.ndarray, k: int) -> float:
     """
-    Compute max F1 over all unique score thresholds.
+    Precision@K for token scores.
 
-    Here we treat the explainer as a binary classifier over tokens:
-        score >= tau  -> predicted important
-        score <  tau  -> predicted unimportant
+    We treat the explainer as producing a *ranking* over tokens. Precision@K asks:
+        among the top-K highest-scoring tokens, what fraction are truly positive?
 
-    F1 is computed against the strict/lenient token labels.
+    Returns NaN if K is invalid or if there are no positives in y.
     """
-    if y.sum() == 0 or y.sum() == len(y):
-        # no positives or no negatives: F1 not very meaningful
+    scores = np.asarray(scores, dtype=float)
+    y = np.asarray(y, dtype=int)
+
+    if scores.size == 0 or y.size == 0:
         return float("nan")
 
-    thresholds = np.unique(scores)[::-1]  # candidate cutoffs (high -> low)
+    k = int(k)
+    if k <= 0:
+        return float("nan")
+    k = min(k, y.size)
 
-    best = 0.0
-    for tau in thresholds:
-        y_hat = scores >= tau
-        f1 = f1_score(y, y_hat)
-        if f1 > best:
-            best = f1
-    return best
+    if y.sum() == 0:
+        return float("nan")  # nothing to retrieve
 
+    idx = np.argsort(scores, kind="mergesort")[::-1][:k]
+    return float(y[idx].sum() / float(k))
 
 # --------------------------------------------------------------------------- #
 # AttAUC computation
@@ -1038,28 +1038,22 @@ def best_f1_for_labels(scores: np.ndarray, y: np.ndarray) -> float:
 @dataclass
 class AttAUCResult:
     """
-    Container for token-level explanation metrics.
+    Container for token-level explanation *accuracy* metrics.
 
-    strict_auc / lenient_auc :
+    strict_auc / lenient_auc:
         AttAUC values (ranking-based accuracy) under strict / lenient labels.
 
-    n_tokens :
-        Number of tokens used for this evaluation.
-
-    strict_f1 / lenient_f1 :
-        Best F1 over all thresholds on the explanation scores, for strict /
-        lenient labels. These are threshold-based accuracy measures; we treat
-        the explainer as a binary classifier over tokens and ask:
-            "how well can it separate important vs unimportant tokens
-             if we choose the optimal threshold?"
+    strict_p_at_k / lenient_p_at_k:
+        Precision@K values under strict / lenient labels.
+        (Among the top-K tokens by score, how many are labeled positive?)
     """
     strict_auc: float
     lenient_auc: float
     n_tokens: int
-    strict_f1: float = math.nan
-    lenient_f1: float = math.nan
 
-
+    precision_k: int = 20
+    strict_p_at_k: float = math.nan
+    lenient_p_at_k: float = math.nan
 @dataclass
 class DebugToken:
     idx: int
@@ -1086,16 +1080,18 @@ def token_level_attauc(
     class_name: str,
     r_sec: Sequence[float],
     lead_names: Sequence[str] = LEADS12,
+    *,
+    precision_k: int = 20,
 ) -> AttAUCResult:
     """
-    Compute strict & lenient AttAUC + F1 for a set of per-lead spans.
+    Compute strict & lenient AttAUC + Precision@K for a set of per-lead spans.
 
-    This is where we:
+    Steps:
       - build windows from R-peaks,
       - build tokens (lead × window),
       - integrate attribution into token scores,
       - optionally blend in class-specific priors (sinus / AF / VPB),
-      - compute rank-based AttAUC and threshold-based F1.
+      - compute rank-based AttAUC and ranking-based Precision@K.
     """
     cfg = REGISTRY[class_name]
     windows = build_windows_from_rpeaks(r_sec, class_name=class_name)
@@ -1112,18 +1108,19 @@ def token_level_attauc(
     y_strict = make_labels_for_tokens(tokens, cfg.strict_leads, cfg.window_keys, windows)
     y_lenient = make_labels_for_tokens(tokens, cfg.lenient_leads, cfg.window_keys, windows)
 
-    f1_strict = best_f1_for_labels(scores, y_strict)
-    f1_lenient = best_f1_for_labels(scores, y_lenient)
-
     auc_s = rank_auc(scores, y_strict)
     auc_l = rank_auc(scores, y_lenient)
+
+    p_s = precision_at_k(scores, y_strict, k=precision_k)
+    p_l = precision_at_k(scores, y_lenient, k=precision_k)
 
     return AttAUCResult(
         strict_auc=auc_s,
         lenient_auc=auc_l,
         n_tokens=len(tokens),
-        strict_f1=f1_strict,
-        lenient_f1=f1_lenient,
+        precision_k=int(precision_k),
+        strict_p_at_k=p_s,
+        lenient_p_at_k=p_l,
     )
 
 def compute_token_scores_and_labels(
@@ -1700,7 +1697,6 @@ SINUS_NAME = "sinus rhythm"  # must match REGISTRY / TARGET_META["426783006"]["n
 SINUS_PREF_LEADS = ["II", "V1", "I", "aVF", "V2"]
 SINUS_PREF_WINDOW_TYPES = ("pre",)  # favour P-wave windows
 
-
 def apply_sinus_prior_blend(
     class_name: str,
     tokens,
@@ -1756,30 +1752,34 @@ AF_NAME = "atrial fibrillation"
 AF_PREF_LEADS = ["II", "V1", "III", "aVF", "V2"]
 AF_PREF_WINDOW_TYPES = ["beat", "qrs"]
 
-
 def apply_af_prior_blend(
     class_name: str,
     tokens,
     windows: BeatWindows,
     scores: np.ndarray,
     alpha: float = 0.8,
+    allowed_leads: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
     """
     Blend token scores with an AF prior.
 
-    alpha = 0.0 -> pure model-based scores
-    alpha = 1.0 -> pure prior (tokens in AF_PREF_LEADS & AF_PREF_WINDOW_TYPES)
+    allowed_leads:
+        If provided, the prior is ONLY applied to tokens whose lead is in allowed_leads.
+        Prevents strict leakage from lenient-only leads.
     """
     if class_name != AF_NAME:
         return scores
 
-    scores = scores.astype(float)
-    if scores.max() > 0:
-        scores = scores / scores.max()
+    scores = np.asarray(scores, dtype=float).copy()
+    if scores.size and scores.max() > 0:
+        scores /= scores.max()
+
+    allowed = set(map(str, allowed_leads)) if allowed_leads is not None else None
 
     n = len(tokens)
     prior = np.zeros(n, dtype=float)
 
+    # Map (start,end) -> window type
     win_map: Dict[Tuple[float, float], str] = {}
     for k, lst in (
         ("pre",      windows.pre),
@@ -1795,13 +1795,19 @@ def apply_af_prior_blend(
             win_map[w] = k
 
     for idx, (lead, (s, e)) in enumerate(tokens):
+        lead = str(lead)
+
+        # ---- STRICT/LENIENT SAFE GATE ----
+        if allowed is not None and lead not in allowed:
+            continue
+
         win_type = win_map.get((s, e), "")
-        if (str(lead) in AF_PREF_LEADS) and (win_type in AF_PREF_WINDOW_TYPES):
+        if (lead in AF_PREF_LEADS) and (win_type in AF_PREF_WINDOW_TYPES):
             prior[idx] = 1.0
 
     blended = alpha * prior + (1.0 - alpha) * scores
-    if blended.max() > 0:
-        blended = blended / blended.max()
+    if blended.size and blended.max() > 0:
+        blended /= blended.max()
     return blended
 
 
@@ -1811,30 +1817,34 @@ VPB_NAME = "ventricular premature beats"
 VPB_PREF_LEADS = ["V1", "V2", "V3", "V4", "II"]
 VPB_PREF_WINDOW_TYPES = ("qrs", "qrs_on", "qrs_term", "beat")
 
-
 def apply_vpb_prior_blend(
     class_name: str,
     tokens,
     windows: BeatWindows,
     scores: np.ndarray,
     alpha: float = 0.8,
+    allowed_leads: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
     """
     Blend token scores with a VPB prior.
 
-    alpha = 0.0 -> pure model-based scores
-    alpha = 1.0 -> pure prior (tokens in VPB_PREF_LEADS & VPB_PREF_WINDOW_TYPES)
+    allowed_leads:
+        If provided, the prior is ONLY applied to tokens whose lead is in allowed_leads.
+        Prevents strict leakage from lenient-only leads.
     """
     if class_name != VPB_NAME:
         return scores
 
-    scores = scores.astype(float)
-    if scores.max() > 0:
-        scores = scores / scores.max()
+    scores = np.asarray(scores, dtype=float).copy()
+    if scores.size and scores.max() > 0:
+        scores /= scores.max()
+
+    allowed = set(map(str, allowed_leads)) if allowed_leads is not None else None
 
     n = len(tokens)
     prior = np.zeros(n, dtype=float)
 
+    # Map (start,end) -> window type
     win_map: Dict[Tuple[float, float], str] = {}
     for k, lst in (
         ("pre",      windows.pre),
@@ -1850,13 +1860,19 @@ def apply_vpb_prior_blend(
             win_map[w] = k
 
     for idx, (lead, (s, e)) in enumerate(tokens):
+        lead = str(lead)
+
+        # ---- STRICT/LENIENT SAFE GATE ----
+        if allowed is not None and lead not in allowed:
+            continue
+
         win_type = win_map.get((s, e), "")
-        if (str(lead) in VPB_PREF_LEADS) and (win_type in VPB_PREF_WINDOW_TYPES):
+        if (lead in VPB_PREF_LEADS) and (win_type in VPB_PREF_WINDOW_TYPES):
             prior[idx] = 1.0
 
     blended = alpha * prior + (1.0 - alpha) * scores
-    if blended.max() > 0:
-        blended = blended / blended.max()
+    if blended.size and blended.max() > 0:
+        blended /= blended.max()
     return blended
 
 
@@ -1869,26 +1885,22 @@ class EvaluationOutput:
     """
     Per-ECG evaluation bundle.
 
-    strict_attauc / lenient_attauc :
+    strict_attauc / lenient_attauc:
         ACCURACY (ranking-based) – AttAUC under strict / lenient labels.
 
-    n_tokens :
-        Number of tokens used for this evaluation.
+    strict_p_at_k / lenient_p_at_k:
+        ACCURACY (top-K based) – Precision@K under strict / lenient labels.
 
-    strict_f1 / lenient_f1 :
-        ACCURACY (threshold-based) – best F1 over all thresholds on the
-        explanation scores for strict / lenient labels.
-
-    deletion_curve :
+    deletion_curve:
         FAITHFULNESS – full deletion curve (fractions, probs) showing how
         the model's probability changes as we delete top-ranked tokens.
 
-    deletion_auc :
+    deletion_auc:
         FAITHFULNESS – scalar area under the deletion curve.
         Lower values mean a faster drop in probability when deleting
         “important” tokens, i.e. more faithful explanations.
 
-    debug :
+    debug:
         Optional DebugInfo with token-level inspection details.
     """
     strict_attauc: float
@@ -1897,11 +1909,12 @@ class EvaluationOutput:
     deletion_curve: Optional[DeletionCurve]
     debug: Optional[DebugInfo]
 
-    strict_f1: float = math.nan
-    lenient_f1: float = math.nan
+    precision_k: int = 20
+    strict_p_at_k: float = math.nan
+    lenient_p_at_k: float = math.nan
+
     deletion_auc: float = math.nan
     faithfulness_gain: float = math.nan
-
 def evaluate_explanation(
     mat_path: str,
     fs: float,
@@ -1930,7 +1943,7 @@ def evaluate_explanation(
 
     Returns
     -------
-    EvaluationOutput with AttAUC, F1, deletion AUC, and optional debug info.
+    EvaluationOutput with AttAUC, Precision@K, deletion AUC, and optional debug info.
     """
     x = load_mat_TF(mat_path)
 
@@ -1949,13 +1962,14 @@ def evaluate_explanation(
         r_sec = list(map(float, rpeaks_sec))
 
     # ------------------------------------------------------------------
-    # Token-level AttAUC + F1
+    # Token-level AttAUC + Precision@K
     # ------------------------------------------------------------------
     att = token_level_attauc(
         perlead_spans,
         class_name,
         r_sec,
         lead_names=lead_names,
+        precision_k=precision_k,
     )
 
     debug_info: Optional[DebugInfo] = None
@@ -2052,11 +2066,19 @@ def evaluate_explanation(
         n_tokens=att.n_tokens,
         deletion_curve=curve,
         debug=debug_info,
-        strict_f1=att.strict_f1,
-        lenient_f1=att.lenient_f1,
+
+        precision_k=att.precision_k,
+        strict_p_at_k=att.strict_p_at_k,
+        lenient_p_at_k=att.lenient_p_at_k,
+
         deletion_auc=del_auc,
         faithfulness_gain=faith_gain,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation over all payloads (per class, per ECG)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -2070,6 +2092,7 @@ def evaluate_all_payloads(
     debug: bool = False,
     model=None,
     class_names: Sequence[str] | None = None,
+    precision_k: int = 20,
 ) -> pd.DataFrame:
     """
     all_payloads: {meta_code -> {sel_idx -> payload}}
@@ -2086,7 +2109,7 @@ def evaluate_all_payloads(
     -------
     DataFrame with one row per (meta_code, ECG, method) containing:
         - strict_attauc / lenient_attauc
-        - strict_f1 / lenient_f1
+        - strict_p_at_k / lenient_p_at_k (Precision@K)
         - deletion_auc
         - n_tokens
     """
@@ -2140,7 +2163,7 @@ def evaluate_all_payloads(
             # Sampling freq from header
             fs = infer_fs_from_header(hea_path)  # returns float or int
 
-            # Run AttAUC (+ F1) and, if predict_proba is not None, also
+            # Run AttAUC (+ Precision@K) and, if predict_proba is not None, also
             # deletion-based FAITHFULNESS metrics.
             result = evaluate_explanation(
                 mat_path=str(mat_path),
@@ -2149,6 +2172,7 @@ def evaluate_all_payloads(
                 class_name=class_name,
                 rpeaks_sec=None,          # let it detect its own R-peaks
                 lead_names=LEADS12,       # ("I","II",...,"V6")
+                precision_k=precision_k,
                 model_predict_proba=predict_proba,
                 debug=debug,
             )
@@ -2164,9 +2188,10 @@ def evaluate_all_payloads(
                 "strict_attauc": result.strict_attauc,
                 "lenient_attauc": result.lenient_attauc,
 
-                # ACCURACY (threshold-based)
-                "strict_f1": result.strict_f1,
-                "lenient_f1": result.lenient_f1,
+                # ACCURACY (top-K based)
+                "precision_k": result.precision_k,
+                "strict_p_at_k": result.strict_p_at_k,
+                "lenient_p_at_k": result.lenient_p_at_k,
 
                 # FAITHFULNESS (deletion AUC)
                 "deletion_auc": result.deletion_auc,

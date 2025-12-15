@@ -1,3 +1,3 @@
 MAXLEN = 5000
 RANDOM_SEED = 42
-DATA_ROOT = 'C:/data/'
+DATA_ROOT = 'C:/UHull/Data'
