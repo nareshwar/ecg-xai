@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 import numpy as np
-from pathlib import Path
-from typing import Tuple, List, Optional
 import re
+import json
+import pandas as pd
+import joblib
 from scipy.io import loadmat
 from tqdm import tqdm
+from pathlib import Path
+from typing import Tuple, List, Optional
 
 def import_key_data(
     root: str | Path,
@@ -264,4 +269,32 @@ def parse_header(
             label = m.group(1).strip()
 
     return sex, age, label, signal_len, fs
+
+def save_run(run_dir, all_fused_payloads, df_lime_all, df_ts_all, sel_df, meta=None):
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # DataFrames
+    df_lime_all.to_parquet(run_dir / "df_lime_all.parquet", index=False)
+    df_ts_all.to_parquet(run_dir / "df_ts_all.parquet", index=False)
+    sel_df.to_parquet(run_dir / "sel_df.parquet", index=False)
+
+    # Nested payloads
+    joblib.dump(all_fused_payloads, run_dir / "all_fused_payloads.joblib", compress=3)
+
+    # Metadata
+    if meta is None:
+        meta = {}
+    with open(run_dir / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+def load_run(run_dir):
+    run_dir = Path(run_dir)
+
+    df_lime_all = pd.read_parquet(run_dir / "df_lime_all.parquet")
+    df_ts_all = pd.read_parquet(run_dir / "df_ts_all.parquet")
+    sel_df = pd.read_parquet(run_dir / "sel_df.parquet")
+    all_fused_payloads = joblib.load(run_dir / "all_fused_payloads.joblib")
+
+    return all_fused_payloads, df_lime_all, df_ts_all, sel_df
 

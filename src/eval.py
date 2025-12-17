@@ -1915,6 +1915,7 @@ class EvaluationOutput:
 
     deletion_auc: float = math.nan
     faithfulness_gain: float = math.nan
+
 def evaluate_explanation(
     mat_path: str,
     fs: float,
@@ -1922,6 +1923,8 @@ def evaluate_explanation(
     class_name: str,
     rpeaks_sec: Optional[Sequence[float]] = None,
     lead_names: Sequence[str] = LEADS12,
+    *,
+    precision_k: int = 20,
     model_predict_proba: Optional[Callable[[np.ndarray], float]] = None,
     deletion_fractions: Sequence[float] = (0.05, 0.1, 0.2, 0.3),
     baseline: str = "zero",

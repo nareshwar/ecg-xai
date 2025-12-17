@@ -9,7 +9,22 @@ description = "ECG explainability toolbox (LIME, TimeSHAP, fused plots, evaluati
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Your Name" }]
-dependencies = []
+
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy",
+  "scikit-learn",
+  "matplotlib",
+  "tqdm",
+  "keras",
+  "joblib",
+  "tensorflow",
+  "pyarrow>=12",
+  "pytest", 
+  "ruff", 
+  "mypy"
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,6 +1,6 @@
 import os
 import numpy as np
-from keras.preprocessing.sequence import pad_sequences
+from keras.utils import pad_sequences
 
 from config import MAXLEN
 from utils import load_physionet_data
