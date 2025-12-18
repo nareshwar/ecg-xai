@@ -7,9 +7,9 @@ TARGET_META = {
         "name": "sinus rhythm",
         "aliases": ["426783006"],
     },
-    "17338001": {    # Ventricular premature beats (VPB)
-        "name": "ventricular premature beats",
-        # IMPORTANT: treat both codes as same diagnosis
-        "aliases": ["17338001", "427172004"],
-    },
+    # "17338001": {    # Ventricular premature beats (VPB)
+    #     "name": "ventricular premature beats",
+    #     # IMPORTANT: treat both codes as same diagnosis
+    #     "aliases": ["17338001", "427172004"],
+    # },
 }
