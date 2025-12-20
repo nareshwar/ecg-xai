@@ -23,7 +23,11 @@ dependencies = [
   "pyarrow>=12",
   "pytest", 
   "ruff", 
-  "mypy"
+  "mypy",
+  "plotly",
+  "nbformat>=4.2.0",
+  "statsmodels",
+  "kaleido"
 ]
 
 [tool.setuptools]
