@@ -1,10 +1,10 @@
-"""
-stability_eval.py — Extra-beat augmentation + regionwise stability ONLY.
+"""stability_eval.py — Extra-beat augmentation + regionwise stability ONLY.
 
-- Adds one duplicate beat (end / middle)
+- Adds ONE duplicate beat by copying a randomly-selected beat (seeded), and inserting it
+  immediately after that beat ("middle" insertion). We intentionally avoid edge beats.
 - Saves augmented MATs to AUGMENT_ROOT (NOT into your dataset folder)
 - Runs fused explainer for original + augmented
-- Computes regionwise stability (Spearman + Jaccard@K) while ignoring the extra beat
+- Computes regionwise stability (Spearman + Jaccard@K, plus extras) while ignoring the extra beat
 """
 
 from __future__ import annotations
@@ -39,6 +39,68 @@ from eval import (
 
 ROOT = Path.cwd().parent
 AUGMENT_ROOT = Path( ROOT / "outputs" / "extra_beat_aug")  # change if you want
+
+
+def _init_rng(
+    seed: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[int, np.random.Generator]:
+    """Return (seed, rng) where seed is always an int suitable for reproducing choices."""
+    if rng is not None:
+        # If caller supplies rng, we still want a seed value to record in filenames.
+        if seed is None:
+            # Draw a deterministic-ish integer from the provided RNG.
+            seed = int(rng.integers(0, 2**31 - 1))
+        return int(seed), rng
+
+    if seed is None:
+        # Generate a seed and record it, so outputs remain reproducible if re-run.
+        seed = int(np.random.SeedSequence().entropy)
+    return int(seed), np.random.default_rng(int(seed))
+
+
+def _choose_non_edge_beat_index(
+    x: np.ndarray,
+    fs: float,
+    rng: np.random.Generator,
+    *,
+    pre_sec: float = 0.30,
+    post_sec: float = 0.40,
+    edge_beats: int = 1,
+    lead_names: Sequence[str] = LEADS12,
+    prefer: Sequence[str] = ("II", "V2", "V3"),
+) -> int:
+    """Pick a beat index (by R-peak list index) while avoiding edge beats.
+
+    Strategy:
+      1) Exclude the first/last `edge_beats` beats.
+      2) Filter to beats whose extraction window stays in-bounds (no clipping).
+      3) Fall back to the middle beat if candidates are empty.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    T = int(x.shape[0])
+    r_idx = detect_rpeaks(x, fs, prefer=prefer, lead_names=lead_names)
+    n = int(r_idx.size)
+    if n == 0:
+        raise ValueError("No R-peaks detected; cannot choose beat_index.")
+
+    lo = int(max(0, edge_beats))
+    hi = int(min(n, n - max(0, edge_beats)))
+    candidates = list(range(lo, hi))
+    if not candidates:
+        return int(n // 2)
+
+    good: List[int] = []
+    for bi in candidates:
+        r = int(r_idx[bi])
+        s = int(round(r - pre_sec * fs))
+        e = int(round(r + post_sec * fs))
+        if (s >= 0) and (e <= T) and (e > s):
+            good.append(int(bi))
+
+    pool = good if good else candidates
+    return int(rng.choice(pool))
+
 
 def add_extra_beat(
     x: np.ndarray,
@@ -367,6 +429,10 @@ def make_augmented_sel_df_for_one_record(
     mat_path: str,
     class_code: str,
     fs: float,
+    *,
+    seed: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+    edge_beats: int = 1,
     maxlen: int = MAXLEN,
     out_root: Path = AUGMENT_ROOT,
     overwrite: bool = False,
@@ -375,9 +441,23 @@ def make_augmented_sel_df_for_one_record(
     rec_dir = out_root / mat_path.stem
     rec_dir.mkdir(parents=True, exist_ok=True)
 
+    seed_used, rng_used = _init_rng(seed=seed, rng=rng)
+
     x_orig = load_mat_TF(str(mat_path))
-    x_extra_end = add_extra_beat(x_orig, fs, location="end", max_len=maxlen)
-    x_extra_mid = add_extra_beat(x_orig, fs, location="middle", max_len=maxlen)
+    beat_index = _choose_non_edge_beat_index(
+        x_orig,
+        float(fs),
+        rng_used,
+        edge_beats=int(edge_beats),
+    )
+    x_extra = add_extra_beat(
+        x_orig,
+        float(fs),
+        location="middle",
+        beat_index=int(beat_index),
+        max_len=maxlen,
+    )
+    suffix = f"_extra_seed{int(seed_used)}_beat{int(beat_index)}"
 
     def _save_variant(x_tf: np.ndarray, suffix: str, sel_idx: int) -> Dict:
         new_mat = rec_dir / f"{mat_path.stem}{suffix}{mat_path.suffix}"
@@ -387,12 +467,23 @@ def make_augmented_sel_df_for_one_record(
             dst_hea = new_mat.with_suffix(".hea")
             if src_hea.exists():
                 copyfile(src_hea, dst_hea)
-        return {"group_class": class_code, "filename": str(new_mat), "sel_idx": int(sel_idx)}
+        return {
+            "group_class": class_code,
+            "filename": str(new_mat),
+            "sel_idx": int(sel_idx),
+            "augment_seed": int(seed_used),
+            "augment_beat_index": int(beat_index),
+        }
 
     rows = [
-        {"group_class": class_code, "filename": str(mat_path), "sel_idx": 0},
-        _save_variant(x_extra_end, "_extra_end", 1),
-        _save_variant(x_extra_mid, "_extra_mid", 2),
+        {
+            "group_class": class_code,
+            "filename": str(mat_path),
+            "sel_idx": 0,
+            "augment_seed": np.nan,
+            "augment_beat_index": np.nan,
+        },
+        _save_variant(x_extra, suffix, 1),
     ]
     return pd.DataFrame(rows)
 
@@ -402,6 +493,10 @@ def run_extra_beat_stability_experiment(
     model,
     class_names: Sequence[str],
     *,
+    seed: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+    edge_beats: int = 1,
+    overwrite: bool = False,
     maxlen: int = MAXLEN,
     beat_tolerance_sec: float = 0.08,
     k: int = 20,
@@ -414,9 +509,12 @@ def run_extra_beat_stability_experiment(
         mat_path=mat_path,
         class_code=str(snomed_code),
         fs=float(fs),
+        seed=seed,
+        rng=rng,
+        edge_beats=edge_beats,
         maxlen=maxlen,
         out_root=augment_root,
-        overwrite=False,
+        overwrite=bool(overwrite),
     )
 
     all_fused_payloads, df_lime_all, df_ts_all = run_fused_pipeline_for_classes(
@@ -430,37 +528,30 @@ def run_extra_beat_stability_experiment(
 
     fused_for_cls = all_fused_payloads[str(snomed_code)]
     payload_orig = fused_for_cls[0]
-    payload_extra_end = fused_for_cls[1]
-    payload_extra_mid = fused_for_cls[2]
+    payload_extra = fused_for_cls[1]
 
     mat_path_p = Path(mat_path)
-    rec_dir = augment_root / mat_path_p.stem
-    mat_extra_end = rec_dir / f"{mat_path_p.stem}_extra_end{mat_path_p.suffix}"
-    mat_extra_mid = rec_dir / f"{mat_path_p.stem}_extra_mid{mat_path_p.suffix}"
+    mat_extra = Path(sel_df.loc[sel_df["sel_idx"] == 1, "filename"].iloc[0])
 
     class_name_eval = str(TARGET_META[str(snomed_code)]["name"])
 
-    metrics_end = stability_with_extra_beat_regionwise(
+    metrics_extra = stability_with_extra_beat_regionwise(
         mat_path_a=str(mat_path_p),
-        mat_path_b=str(mat_extra_end),
+        mat_path_b=str(mat_extra),
         fs=float(fs),
         payload_a=payload_orig,
-        payload_b=payload_extra_end,
+        payload_b=payload_extra,
         class_name_eval=class_name_eval,
         k=k,
         beat_tolerance_sec=beat_tolerance_sec,
     )
 
-    metrics_mid = stability_with_extra_beat_regionwise(
-        mat_path_a=str(mat_path_p),
-        mat_path_b=str(mat_extra_mid),
-        fs=float(fs),
-        payload_a=payload_orig,
-        payload_b=payload_extra_mid,
-        class_name_eval=class_name_eval,
-        k=k,
-        beat_tolerance_sec=beat_tolerance_sec,
-    )
-
-    metrics = {"extra_end": metrics_end, "extra_mid": metrics_mid}
+    # Surface the augmentation choice in the return value, too.
+    aug_row = sel_df.loc[sel_df["sel_idx"] == 1].iloc[0]
+    metrics = {
+        "extra": metrics_extra,
+        "augment_seed": int(aug_row["augment_seed"]),
+        "augment_beat_index": int(aug_row["augment_beat_index"]),
+        "augmented_file": str(mat_extra),
+    }
     return metrics, sel_df, all_fused_payloads, df_lime_all, df_ts_all
