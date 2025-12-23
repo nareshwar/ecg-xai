@@ -617,23 +617,27 @@ def token_level_attauc(
     lead_names: Sequence[str] = LEADS12,
     *,
     precision_k: int = 20,
+    use_priors: bool = True,
+    prior_alpha: float = 0.8,
 ) -> AttAUCResult:
     cfg = REGISTRY[class_name]
     windows = build_windows_from_rpeaks(r_sec, class_name=class_name)
     tokens = build_tokens(lead_names, windows, which=cfg.window_keys)
 
     scores = integrate_attribution(perlead_spans, tokens)
-    scores = apply_sinus_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
-    scores = apply_af_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
-    scores = apply_vpb_prior_blend(class_name, tokens, windows, scores, alpha=0.8)
 
-    y_strict = make_labels_for_tokens(tokens, cfg.strict_leads, cfg.window_keys, windows)
+    if use_priors:
+        scores = apply_sinus_prior_blend(class_name, tokens, windows, scores, alpha=prior_alpha)
+        scores = apply_af_prior_blend(class_name, tokens, windows, scores, alpha=prior_alpha)
+        scores = apply_vpb_prior_blend(class_name, tokens, windows, scores, alpha=prior_alpha)
+
+    y_strict  = make_labels_for_tokens(tokens, cfg.strict_leads,  cfg.window_keys, windows)
     y_lenient = make_labels_for_tokens(tokens, cfg.lenient_leads, cfg.window_keys, windows)
 
     auc_s = rank_auc(scores, y_strict)
     auc_l = rank_auc(scores, y_lenient)
-    p_s = precision_at_k(scores, y_strict, k=precision_k)
-    p_l = precision_at_k(scores, y_lenient, k=precision_k)
+    p_s   = precision_at_k(scores, y_strict,  k=precision_k)
+    p_l   = precision_at_k(scores, y_lenient, k=precision_k)
 
     return AttAUCResult(
         strict_auc=auc_s,
@@ -643,6 +647,7 @@ def token_level_attauc(
         strict_p_at_k=p_s,
         lenient_p_at_k=p_l,
     )
+
 
 # --------------------------------------------------------------------------- #
 # Faithfulness: deletion curves
@@ -802,6 +807,8 @@ def evaluate_explanation(
     lead_names: Sequence[str] = LEADS12,
     *,
     precision_k: int = 20,
+    use_priors: bool = True,
+    prior_alpha: float = 0.8,
     model_predict_proba: Optional[Callable[[np.ndarray], float]] = None,
     deletion_fractions: Sequence[float] = (0.05, 0.1, 0.2, 0.3),
     baseline: str = "zero",
@@ -827,6 +834,8 @@ def evaluate_explanation(
         r_sec,
         lead_names=lead_names,
         precision_k=precision_k,
+        use_priors=use_priors,
+        prior_alpha=prior_alpha,
     )
 
     curve = None
@@ -879,6 +888,8 @@ def evaluate_all_payloads(
     model=None,
     class_names: Sequence[str] | None = None,
     precision_k: int = 20,
+    use_priors: bool = True,
+    prior_alpha: float = 0.8,
     baseline: str = "zero",
     deletion_fractions: Sequence[float] = (0.05, 0.1, 0.2, 0.3),
     skip_missing_files: bool = True,
@@ -945,6 +956,8 @@ def evaluate_all_payloads(
                 rpeaks_sec=None,
                 lead_names=LEADS12,
                 precision_k=precision_k,
+                use_priors=use_priors,
+                prior_alpha=prior_alpha,
                 model_predict_proba=predict_proba,
                 deletion_fractions=deletion_fractions,
                 baseline=baseline,
