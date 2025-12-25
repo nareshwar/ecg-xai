@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "ECG explainability toolbox (LIME, TimeSHAP, fused plots, evaluation)"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Your Name" }]
+authors = [{ name = "Raju Vaneshwar Nareshwar" }]
 
 dependencies = [
   "numpy",
@@ -20,6 +20,7 @@ dependencies = [
   "keras",
   "joblib",
   "tensorflow",
+  "ecg-plot",
   "pyarrow>=12",
   "pytest", 
   "ruff", 
