@@ -8,11 +8,11 @@ from typing import Sequence, Dict, Optional, Tuple, Any
 import pandas as pd
 from tqdm import tqdm
 
-from ecg_lime import run_lime_for_one_class_from_sel
-from ecg_timeshap import run_timeshap_for_one_class_from_sel
-from fusion import fuse_lime_timeshap_payload
-from payload import payload_from_lime_row, payload_from_timeshap_row
-from plot import plot_from_payload
+from .ecg_lime import run_lime_for_one_class_from_sel
+from .ecg_timeshap import run_timeshap_for_one_class_from_sel
+from .fusion import fuse_lime_timeshap_payload
+from .payload import payload_from_lime_row, payload_from_timeshap_row
+from .plot import plot_from_payload
 
 # ---------------------------------------------------------------------
 # Lead-prior registry keyed by SNOMED CT codes for your target classes.

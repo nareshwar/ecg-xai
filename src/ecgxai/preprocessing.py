@@ -2,8 +2,8 @@ import os
 import numpy as np
 from keras.utils import pad_sequences
 
-from config import MAXLEN
-from utils import load_physionet_data
+from .config import MAXLEN
+from .utils import load_physionet_data
 
 def preprocess_for_model(mat_path, maxlen=MAXLEN):
     """

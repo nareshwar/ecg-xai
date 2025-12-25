@@ -16,9 +16,9 @@ import json
 import numpy as np
 import pandas as pd
 
-from utils import weighted_ridge_fit, class_index
-from preprocessing import ensure_paths, parse_fs_and_leads, load_mat_TF
-from ecg_lime import make_event_segments, prior_probs_from_names
+from .utils import weighted_ridge_fit, class_index
+from .preprocessing import ensure_paths, parse_fs_and_leads, load_mat_TF
+from .ecg_lime import make_event_segments, prior_probs_from_names
 
 # ---------------------------------------------------------------------
 # KernelSHAP utilities

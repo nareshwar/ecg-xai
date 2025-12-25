@@ -5,9 +5,9 @@ from matplotlib.patches import Patch
 import ecg_plot
 import numpy as np
 
-from preprocessing import infer_fs_from_header
-from payload import _infer_fs_from_header_lines
-from utils import load_physionet_data
+from .preprocessing import infer_fs_from_header
+from .payload import _infer_fs_from_header_lines
+from .utils import load_physionet_data
 
 LIMB   = ["I","II","III","aVR","aVL","aVF"]
 VLEADS = ["V1","V2","V3","V4","V5","V6"]
