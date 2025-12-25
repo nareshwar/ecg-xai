@@ -29,9 +29,9 @@ from scipy.io import loadmat
 from scipy.signal import butter, filtfilt, find_peaks
 from pathlib import Path
 
-from config import MAXLEN
-from preprocessing import infer_fs_from_header
-from config_targets import TARGET_META
+from .config import MAXLEN
+from .preprocessing import infer_fs_from_header
+from .config_targets import TARGET_META
 
 # --------------------------------------------------------------------------- #
 # Constants
