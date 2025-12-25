@@ -24,7 +24,7 @@ from .config_targets import TARGET_META
 from .explainer import run_fused_pipeline_for_classes
 
 # Import what we need from eval.py (core)
-from eval import (
+from .eval import (
     LEADS12,
     load_mat_TF,
     detect_rpeaks,
