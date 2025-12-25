@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,7 @@ description = "ECG explainability toolbox (LIME, TimeSHAP, fused plots, evaluati
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Raju Vaneshwar Nareshwar" }]
+license = { text = "MIT" }
 
 dependencies = [
   "numpy",
@@ -17,18 +18,22 @@ dependencies = [
   "scikit-learn",
   "matplotlib",
   "tqdm",
-  "keras",
   "joblib",
   "tensorflow",
+  "keras",
   "ecg-plot",
   "pyarrow>=12",
-  "pytest", 
-  "ruff", 
-  "mypy",
   "plotly",
   "nbformat>=4.2.0",
   "statsmodels",
   "kaleido"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+  "mypy"
 ]
 
 [tool.setuptools]
@@ -36,3 +41,16 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["ecgxai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
