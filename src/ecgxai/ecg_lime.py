@@ -4,8 +4,8 @@ import pandas as pd
 from sklearn.metrics import pairwise_distances
 from sklearn.linear_model import Ridge
 
-from preprocessing import ensure_paths, parse_fs_and_leads, load_mat_TF
-from utils import cosine_distance_to_ones, weighted_ridge_fit, class_index
+from .preprocessing import ensure_paths, parse_fs_and_leads, load_mat_TF
+from .utils import cosine_distance_to_ones, weighted_ridge_fit, class_index
 
 def lime_events(model, x_tf, class_idx, segments, m_masks=200, kernel_width=0.25, rng=42):
     """
