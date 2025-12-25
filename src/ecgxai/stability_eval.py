@@ -18,10 +18,10 @@ import numpy as np
 import pandas as pd
 from scipy.io import savemat
 
-from config import MAXLEN
-from preprocessing import ensure_paths, parse_fs_and_leads
-from config_targets import TARGET_META
-from explainer import run_fused_pipeline_for_classes
+from .config import MAXLEN
+from .preprocessing import ensure_paths, parse_fs_and_leads
+from .config_targets import TARGET_META
+from .explainer import run_fused_pipeline_for_classes
 
 # Import what we need from eval.py (core)
 from eval import (
