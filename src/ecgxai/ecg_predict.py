@@ -4,7 +4,7 @@ from typing import Sequence
 import numpy as np
 from tqdm import tqdm
 
-from preprocessing import preprocess_for_model
+from .preprocessing import preprocess_for_model
 
 
 def batched_predict_all(
