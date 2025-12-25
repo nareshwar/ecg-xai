@@ -1,3 +1,3 @@
 MAXLEN = 5000
 RANDOM_SEED = 42
-DATA_ROOT = 'C:/UHull/Data'
+DATA_ROOT = "/kaggle/input/"
