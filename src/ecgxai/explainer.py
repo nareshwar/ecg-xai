@@ -8,6 +8,30 @@ from typing import Sequence, Dict, Optional, Tuple, Any
 import pandas as pd
 from tqdm import tqdm
 
+# ---------------------------------------------------------------------
+# Logging (showcase-friendly)
+#   ECGXAI_LOG_STYLE = "showcase" | "debug" | "quiet"
+#   - showcase: one line per class + one final line (default)
+#   - debug: detailed stage-by-stage logs (old behaviour)
+#   - quiet: no logs
+# ---------------------------------------------------------------------
+DEFAULT_LOG_STYLE = os.environ.get("ECGXAI_LOG_STYLE", "showcase").lower()
+
+def _resolve_log_style(log_style: Optional[str], verbose: bool) -> str:
+    if verbose:
+        return "debug"
+    s = (str(log_style).lower() if log_style else DEFAULT_LOG_STYLE)
+    if s not in ("quiet", "showcase", "debug"):
+        s = "showcase"
+    return s
+
+def _log(style: str, msg: str) -> None:
+    if style == "quiet":
+        return
+    # tqdm.write plays nicely with progress bars if enabled
+    tqdm.write(msg)
+
+
 from .ecg_lime import run_lime_for_one_class_from_sel
 from .ecg_timeshap import run_timeshap_for_one_class_from_sel
 from .fusion import fuse_lime_timeshap_payload
@@ -213,9 +237,10 @@ def run_fused_for_one_class(
     class_names: Sequence[str],
     max_examples: Optional[int] = None,
     plot: bool = False,
-    progress: bool = True,
-    verbose: bool = True,
-    show_record: bool = True,
+    progress: bool = False,
+    verbose: bool = False,
+    show_record: bool = False,
+    log_style: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[int, Dict]]:
     """
     Run LIME + TimeSHAP + fusion for a single class.
@@ -225,7 +250,10 @@ def run_fused_for_one_class(
     cfg = default_explainer_config(class_name)
     t0 = time.perf_counter()
 
-    if verbose:
+    style = _resolve_log_style(log_style, verbose)
+    debug = style == "debug"
+
+    if debug:
         tqdm.write(
             f"\n FUSED class={class_name} | window={cfg['window_sec']}s "
             f"| m_event={cfg['m_event']} | m_feat={cfg['m_feat']} | topk_events={cfg['topk_events']}"
@@ -249,8 +277,9 @@ def run_fused_for_one_class(
         rng=42,
         params=cfg.get("params"),
     )
-    if verbose:
-        tqdm.write(f" LIME done: {len(df_lime_cls)} rows in {_fmt_s(time.perf_counter()-t_l)}")
+    dt_lime = time.perf_counter() - t_l
+    if debug:
+        tqdm.write(f" LIME done: {len(df_lime_cls)} rows in {_fmt_s(dt_lime)}")
 
     # ---- TimeSHAP ----
     t_t = time.perf_counter()
@@ -269,8 +298,9 @@ def run_fused_for_one_class(
         link="logit",
         params=cfg.get("params"),
     )
-    if verbose:
-        tqdm.write(f" TimeSHAP done: {len(df_ts_cls)} rows in {_fmt_s(time.perf_counter()-t_t)}")
+    dt_lime = time.perf_counter() - t_l
+    if debug:
+        tqdm.write(f" TimeSHAP done: {len(df_ts_cls)} rows in {_fmt_s(dt_ts)}")
 
     # ---- fuse common val_idx ----
     fused_payloads: Dict[int, Dict] = {}
@@ -281,8 +311,9 @@ def run_fused_for_one_class(
     common_val_idx = sorted(
         set(df_lime_cls["val_idx"].astype(int)) & set(df_ts_cls["val_idx"].astype(int))
     )
+    dt_ts = time.perf_counter() - t_t
 
-    if verbose:
+    if debug:
         tqdm.write(f"  Fusing: {len(common_val_idx)} common records")
 
     it = common_val_idx
@@ -323,8 +354,17 @@ def run_fused_for_one_class(
         if plot:
             plot_from_payload(payload_F)
 
-    if verbose:
+    if debug:
         tqdm.write(f"  Class {class_name} total: {_fmt_s(time.perf_counter()-t0)}")
+    dt_total = time.perf_counter() - t0
+    if style == "showcase":
+        _log(style, (
+            f"FUSED {class_name} | n={len(sel_df_cls)} | "
+            f"win={cfg['window_sec']}s mE={cfg['m_event']} mF={cfg['m_feat']} topkE={cfg['topk_events']} | "
+            f"LIME={_fmt_s(dt_lime)} TS={_fmt_s(dt_ts)} | "
+            f"fused={len(common_val_idx)} | total={_fmt_s(dt_total)}"
+        ))
+
 
     return df_lime_cls, df_ts_cls, fused_payloads
 
@@ -336,9 +376,10 @@ def run_fused_pipeline_for_classes(
     class_names: Sequence[str],
     max_examples_per_class: Optional[int] = None,
     plot: bool = False,
-    progress: bool = True,
-    verbose: bool = True,
-    show_record: bool = True,
+    progress: bool = False,
+    verbose: bool = False,
+    show_record: bool = False,
+    log_style: Optional[str] = None,
 ) -> Tuple[Dict[str, Dict[int, Dict]], pd.DataFrame, pd.DataFrame]:
     """
     High-level fused pipeline:
@@ -351,17 +392,17 @@ def run_fused_pipeline_for_classes(
     all_ts: list[pd.DataFrame] = []
 
     classes = list(target_classes)
-    cls_iter = classes
-    if progress:
-        cls_iter = classes
+    cls_iter = tqdm(classes, desc="Classes (Fused)") if progress else classes
 
     t_start = time.perf_counter()
+    style = _resolve_log_style(log_style, verbose)
+    debug = style == "debug"
     times: list[float] = []
 
     for i, cls in enumerate(cls_iter, start=1):
         t_cls = time.perf_counter()
 
-        if verbose:
+        if debug:
             tqdm.write(f"\n=== [{i}/{len(classes)}] Processing class: {cls} ===")
 
         df_lime_cls, df_ts_cls, fused_payloads_cls = run_fused_for_one_class(
@@ -374,6 +415,7 @@ def run_fused_pipeline_for_classes(
             progress=progress,
             verbose=verbose,
             show_record=show_record,
+            log_style=log_style,
         )
 
         all_fused_payloads[cls] = fused_payloads_cls
@@ -383,16 +425,18 @@ def run_fused_pipeline_for_classes(
         dt = time.perf_counter() - t_cls
         times.append(dt)
 
-        if verbose:
+        if debug:
             avg = sum(times) / len(times)
             remaining = (len(classes) - i) * avg
             tqdm.write(f"— Progress: {i}/{len(classes)} classes | ETA ~ {_fmt_s(remaining)}")
 
-    if verbose:
+    if debug:
         tqdm.write(f"\n All classes complete in {_fmt_s(time.perf_counter()-t_start)}")
 
     df_lime_all = pd.concat(all_lime, ignore_index=True) if all_lime else pd.DataFrame()
     df_ts_all = pd.concat(all_ts, ignore_index=True) if all_ts else pd.DataFrame()
+    if style == "showcase":
+        _log(style, f"Fused pipeline complete: {len(classes)} classes in {_fmt_s(time.perf_counter()-t_start)}")
     return all_fused_payloads, df_lime_all, df_ts_all
 
 def _subset_sel_df_for_class(sel_df: pd.DataFrame, class_name: str, max_examples: int | None):
