@@ -1,25 +1,64 @@
+"""
+ecgxai.plot
+
+Plot ECGs with shaded explanation spans from a payload produced by:
+- payload_from_lime_row()
+- payload_from_timeshap_row()
+- fuse_lime_timeshap_payload()
+
+Payload contract:
+    payload = {
+        "mat_path": str,
+        "page_seconds": float,
+        "perlead_spans": {lead: [(start_sec, end_sec, weight), ...], ...},
+        "lead_scores": {lead: float, ...} (optional),
+        "top5_leads": [lead,...] (optional),
+        "method_label": str (optional),
+        "target_label": str (optional),
+    }
+
+Plot convention:
+- 2×6 layout produced by ecg_plot:
+    left column: limb leads I, II, III, aVR, aVL, aVF
+    right column: precordial leads V1..V6
+- Spans for V leads are shifted by +column_width on the x-axis.
+"""
+
+from __future__ import annotations
+
 import os
+from typing import Dict, List, Sequence, Tuple
+
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from matplotlib.patches import Patch
-import ecg_plot
 import numpy as np
+import ecg_plot
 
 from .preprocessing import infer_fs_from_header
-from .payload import _infer_fs_from_header_lines
 from .utils import load_physionet_data
 
-LIMB   = ["I","II","III","aVR","aVL","aVF"]
-VLEADS = ["V1","V2","V3","V4","V5","V6"]
-DEFAULT_LEADS = LIMB + VLEADS
-LEAD_COLOR = {
-    "I":"#2F5597","II":"#E69138","III":"#38761D",
-    "aVR":"#CC0000","aVL":"#674EA7","aVF":"#B45F06",
-    "V1":"#A64D79","V2":"#6AA84F","V3":"#BF9000",
-    "V4":"#3D85C6","V5":"#45818E","V6":"#741B47"
+
+# ---------------------------------------------------------------------
+# Lead layout + colors
+# ---------------------------------------------------------------------
+LIMB: List[str] = ["I", "II", "III", "aVR", "aVL", "aVF"]
+VLEADS: List[str] = ["V1", "V2", "V3", "V4", "V5", "V6"]
+DEFAULT_LEADS: List[str] = LIMB + VLEADS
+
+LEAD_COLOR: Dict[str, str] = {
+    "I": "#2F5597",   "II": "#E69138", "III": "#38761D",
+    "aVR": "#CC0000", "aVL": "#674EA7", "aVF": "#B45F06",
+    "V1": "#A64D79",  "V2": "#6AA84F",  "V3": "#BF9000",
+    "V4": "#3D85C6",  "V5": "#45818E",  "V6": "#741B47",
 }
 
-def _read_header_lines(hea_path):
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def _read_header_lines(hea_path: str) -> List[str]:
+    """Read header lines with robust encoding (used only for debugging)."""
     if not os.path.exists(hea_path):
         return []
     try:
@@ -30,28 +69,35 @@ def _read_header_lines(hea_path):
             return [ln.rstrip("\n") for ln in f]
 
 
-def _bands_from_label_centers(ax):
-    centers = {}
+def _bands_from_label_centers(ax) -> Dict[str, Tuple[float, float]]:
+    """Infer y-bands for each lead from the lead label positions.
+
+    ecg_plot writes lead names as text labels. We parse their y-positions and
+    infer top/bottom edges for each band. Fallback to evenly spaced bands if
+    labels aren't found.
+    """
+    centers: Dict[str, float] = {}
     for t in ax.texts:
         name = t.get_text().strip()
         if name in DEFAULT_LEADS:
             _, y = t.get_position()
             centers[name] = float(y)
 
-    def _from(order):
+    def _from(order: Sequence[str]) -> Dict[str, Tuple[float, float]]:
         ys = [centers[n] for n in order]
-        mids = [(ys[i] + ys[i+1]) / 2 for i in range(len(ys)-1)]
+        mids = [(ys[i] + ys[i + 1]) / 2 for i in range(len(ys) - 1)]
         top = ys[0] + (ys[0] - ys[1]) / 2
         bottom = ys[-1] - (ys[-2] - ys[-1]) / 2
         edges = [top] + mids + [bottom]
-        return {order[i]: (edges[i], edges[i+1]) for i in range(len(order))}
+        return {order[i]: (edges[i], edges[i + 1]) for i in range(len(order))}
 
-    bands = {}
+    bands: Dict[str, Tuple[float, float]] = {}
     if all(n in centers for n in LIMB):
         bands.update(_from(LIMB))
     if all(n in centers for n in VLEADS):
         bands.update(_from(VLEADS))
 
+    # fallback: evenly spaced bands (still works)
     if len(bands) < 12:
         ymin, ymax = ax.get_ylim()
         h = (ymax - ymin) / 12.0
@@ -59,59 +105,23 @@ def _bands_from_label_centers(ax):
             ymid = ymax - (i + 0.5) * h
             pad = 0.48 * h
             bands[n] = (ymid + pad, ymid - pad)
+
     return bands
 
 
-def _clip(span, dom):
-    s, e = span
-    a, b = dom
-    s, e = max(s, a), min(e, b)
-    return None if e <= s else (s, e)
-
-
-def _choose_top5_from_scores(lead_scores, perlead_spans):
-    if isinstance(lead_scores, dict) and lead_scores:
-        return [
-            k for k, _ in sorted(lead_scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        ]
-    return [k for k, _ in sorted(perlead_spans.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]]
-
-import ecg_plot
-
-def _choose_topk_from_scores(lead_scores, perlead_spans, topk: int):
-    """Fallback: choose top-k leads using scores or span counts."""
+def _choose_topk_leads(lead_scores, perlead_spans, topk: int) -> List[str]:
+    """Choose top-k leads using provided lead_scores; fallback to number of spans."""
     if isinstance(lead_scores, dict) and lead_scores:
         ordered = sorted(lead_scores.items(), key=lambda kv: kv[1], reverse=True)
         return [k for k, _ in ordered[:topk]]
-    # if no scores, just use number of spans
-    ordered = sorted(
-        perlead_spans.items(),
-        key=lambda kv: len(kv[1]),
-        reverse=True,
-    )
-    return [k for k, _ in ordered[:topk]]
 
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-from matplotlib.patches import Patch
-import ecg_plot
-
-# column layout
-LIMB   = ["I", "II", "III", "aVR", "aVL", "aVF"]
-VLEADS = ["V1", "V2", "V3", "V4", "V5", "V6"]
-DEFAULT_LEADS = LIMB + VLEADS
-
-
-def _choose_topk_from_scores(lead_scores, perlead_spans, topk: int):
-    if isinstance(lead_scores, dict) and lead_scores:
-        ordered = sorted(lead_scores.items(), key=lambda kv: kv[1], reverse=True)
-        return [k for k, _ in ordered[:topk]]
     ordered = sorted(perlead_spans.items(), key=lambda kv: len(kv[1]), reverse=True)
     return [k for k, _ in ordered[:topk]]
 
 
+# ---------------------------------------------------------------------
+# Main plot function
+# ---------------------------------------------------------------------
 def plot_from_payload(
     payload: dict,
     *,
@@ -119,28 +129,34 @@ def plot_from_payload(
     show_all_leads: bool = False,
     alpha_fill: float = 0.40,
     alpha_min: float = 0.18,
-    edge_alpha: float = 0.8,
+    edge_alpha: float = 0.80,
     tick_major_s: float = 1.0,
     tick_minor_s: float = 0.2,
     figsize=(20, 6),
-):
-    """
-    Plot ECG + shaded explanation rectangles from a fused/LIME/TimeSHAP payload.
+) -> None:
+    """Plot ECG with shaded explanation rectangles from a payload.
 
-    Assumes standard 2×6 layout:
-      - I, II, III, aVR, aVL, aVF in left column
-      - V1–V6 in right column
+    Args:
+        payload: Payload dict (see module docstring).
+        topk: Number of leads to show when payload doesn't specify top5_leads.
+        show_all_leads: If True, show spans for all leads present in payload.
+        alpha_fill: Max fill alpha for the strongest span within each lead.
+        alpha_min: Min fill alpha for weaker spans.
+        edge_alpha: Alpha for the vertical edge lines.
+        tick_major_s: Major x-axis tick spacing in seconds.
+        tick_minor_s: Minor x-axis tick spacing in seconds.
+        figsize: Matplotlib figure size.
 
-    `perlead_spans` times are in seconds 0..page_seconds for *each* lead.
-    We therefore shift V-lead spans by +page_seconds when plotting.
+    Notes:
+        The plot is generated by ecg_plot which renders two columns on the same x-axis.
+        We shift precordial (V*) spans by +column_width to align with the right column.
     """
     mat_path = payload["mat_path"]
     hea_path = os.path.splitext(mat_path)[0] + ".hea"
 
     # ---- load ECG ----
-    data_12xT, _ = load_physionet_data(mat_path)
-    header_lines = _read_header_lines(hea_path)
-    fs = _infer_fs_from_header_lines(header_lines, default=500.0)
+    data_12xT, _ = load_physionet_data(mat_path)  # shape (12, T_raw)
+    fs = float(infer_fs_from_header(hea_path, default=500.0))
 
     page_sec = float(payload.get("page_seconds", data_12xT.shape[1] / fs))
     K = int(round(page_sec * fs))
@@ -153,32 +169,29 @@ def plot_from_payload(
     ax = plt.gca()
     fig = plt.gcf()
 
+    # avoid MAXTICKS warning with long ECGs
     mticker.Locator.MAXTICKS = max(mticker.Locator.MAXTICKS, 10000)
     ax.xaxis.set_major_locator(mticker.MultipleLocator(tick_major_s))
     ax.xaxis.set_minor_locator(mticker.MultipleLocator(tick_minor_s))
 
-    bands = _bands_from_label_centers(ax)  # {lead: (y_top, y_bot)}
-    perlead_spans = payload["perlead_spans"]
-    lead_scores = payload.get("lead_scores", {})
+    bands = _bands_from_label_centers(ax)
+    perlead_spans = payload.get("perlead_spans", {}) or {}
+    lead_scores = payload.get("lead_scores", {}) or {}
 
-    # which leads?
+    # ---- choose leads ----
     if show_all_leads:
         leads_to_show = [L for L in DEFAULT_LEADS if L in perlead_spans]
     else:
         if payload.get("top5_leads"):
             leads_to_show = list(payload["top5_leads"])
         else:
-            leads_to_show = _choose_topk_from_scores(
-                lead_scores, perlead_spans, topk=topk
-            )
-        if topk is not None:
-            leads_to_show = leads_to_show[:topk]
+            leads_to_show = _choose_topk_leads(lead_scores, perlead_spans, topk=topk)
+        leads_to_show = leads_to_show[:topk]
 
     x0, x1 = ax.get_xlim()
-    # ecg_plot uses two equal-width columns across the x-axis
-    col_width = (x1 - x0) / 2.0
+    col_width = (x1 - x0) / 2.0  # ecg_plot uses two equal-width columns
 
-    handles = []
+    handles: List[Patch] = []
 
     for L in leads_to_show:
         if L not in perlead_spans or L not in bands:
@@ -191,26 +204,16 @@ def plot_from_payload(
         y_top, y_bot = bands[L]
         color = LEAD_COLOR.get(L, "#888888")
 
-        # limb leads left column, V-leads right column
-        if L in LIMB:
-            x_shift = 0.0
-        elif L in VLEADS:
-            # shift whole window to second column
-            x_shift = col_width
-        else:
-            x_shift = 0.0  # fallback
+        # limb leads in left column, V leads in right column
+        x_shift = col_width if L in VLEADS else 0.0
 
-        # scale alpha inside this lead by max |weight|
-        weights = np.array(
-            [abs(s[2]) if len(s) >= 3 else 1.0 for s in spans],
-            dtype=float,
-        )
-        wmax = weights.max() if weights.size else None
+        # per-lead alpha scaling: strongest |w| => alpha_fill
+        weights = np.array([abs(float(s[2])) for s in spans], dtype=float)
+        wmax = float(weights.max()) if weights.size else 0.0
 
-        for (s, e, *rest) in spans:
+        for (s, e, w) in spans:
             s = float(s) + x_shift
             e = float(e) + x_shift
-
             if e <= x0 or s >= x1:
                 continue
 
@@ -219,9 +222,9 @@ def plot_from_payload(
             if e_clip <= s_clip:
                 continue
 
-            w = abs(rest[0]) if rest else 1.0
-            if wmax and wmax > 0:
-                a = alpha_min + (alpha_fill - alpha_min) * min(w / wmax, 1.0)
+            ww = abs(float(w))
+            if wmax > 0:
+                a = alpha_min + (alpha_fill - alpha_min) * min(ww / wmax, 1.0)
             else:
                 a = alpha_fill
 
@@ -244,9 +247,7 @@ def plot_from_payload(
                 zorder=0.8,
             )
 
-        handles.append(
-            Patch(facecolor=color, alpha=alpha_fill, edgecolor="none", label=L)
-        )
+        handles.append(Patch(facecolor=color, alpha=alpha_fill, edgecolor="none", label=L))
 
     # ---- title & legend ----
     base = os.path.basename(mat_path)

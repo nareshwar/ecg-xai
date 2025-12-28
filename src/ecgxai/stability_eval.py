@@ -1,18 +1,40 @@
-"""stability_eval.py — Extra-beat augmentation + regionwise stability ONLY.
+"""
+stability_eval.py — Extra-beat augmentation + regionwise stability.
 
-- Adds ONE duplicate beat by copying a randomly-selected beat (seeded), and inserting it
-  immediately after that beat ("middle" insertion). We intentionally avoid edge beats.
-- Saves augmented MATs to AUGMENT_ROOT (NOT into your dataset folder)
-- Runs fused explainer for original + augmented
-- Computes regionwise stability (Spearman + Jaccard@K, plus extras) while ignoring the extra beat
+What this module does
+---------------------
+1) Creates ONE augmented ECG by duplicating a beat (copy a beat segment around an R-peak)
+    and inserting it immediately after that beat (middle insertion). Edge beats are avoided.
+2) Runs the fused explainer (LIME + TimeSHAP + fusion) for original and augmented ECG.
+3) Computes regionwise stability (Spearman + Jaccard@K + extras) while "ignoring"
+    the extra beat by matching beats between recordings based on R-peak timestamps.
+
+Key idea
+--------
+The augmented signal has one additional beat. We align beats between (A) original and (B)
+augmented using R-peak times within a tolerance, and then compare region scores on matched beats.
+
+Expected ECG format
+-------------------
+- load_mat_TF() returns ECG shaped (T, 12) in float.
+- .mat PhysioNet format: savemat(..., {"val": x.T}) where x is (T, 12).
+
+Outputs
+-------
+- run_extra_beat_stability_experiment() returns:
+    metrics: dict with stability metrics + augmentation metadata
+    sel_df: 2-row DataFrame (original + augmented)
+    all_fused_payloads: fused payload dict (per class -> per sel_idx)
+    df_lime_all: LIME dataframe (2 rows)
+    df_ts_all: TimeSHAP dataframe (2 rows)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
 from shutil import copyfile
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,6 +42,7 @@ from scipy.io import savemat
 
 from .config import MAXLEN
 from .preprocessing import ensure_paths, parse_fs_and_leads
+
 from .config_targets import TARGET_META
 from .explainer import run_fused_pipeline_for_classes
 
@@ -32,33 +55,97 @@ from .eval import (
     build_windows_from_rpeaks,
     build_tokens,
     integrate_attribution,
-    apply_sinus_prior_blend,
-    apply_af_prior_blend,
-    apply_vpb_prior_blend,
+    apply_all_priors,
 )
 
 ROOT = Path.cwd().parent
-AUGMENT_ROOT = Path( ROOT / "outputs" / "extra_beat_aug")  # change if you want
+AUGMENT_ROOT = Path(ROOT / "outputs" / "extra_beat_aug")  # change if you want
 
 
+__all__ = [
+    "AUGMENT_ROOT",
+    "add_extra_beat",
+    "explanation_stability",
+    "stability_with_extra_beat_regionwise",
+    "make_augmented_sel_df_for_one_record",
+    "run_extra_beat_stability_experiment",
+]
+
+
+@dataclass(frozen=True)
+class ExtraBeatParams:
+    """Parameters controlling how the extra beat is extracted/inserted."""
+    location: str = "middle"  # "middle" or "end"
+    pre_sec: float = 0.30
+    post_sec: float = 0.40
+    edge_beats: int = 1
+    prefer: Tuple[str, ...] = ("II", "V2", "V3")
+
+
+# ---------------------------------------------------------------------
+# RNG helpers
+# ---------------------------------------------------------------------
 def _init_rng(
     seed: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
 ) -> Tuple[int, np.random.Generator]:
-    """Return (seed, rng) where seed is always an int suitable for reproducing choices."""
+    """Return (seed, rng). If rng is provided, we also produce a reproducible seed for filenames."""
     if rng is not None:
-        # If caller supplies rng, we still want a seed value to record in filenames.
         if seed is None:
-            # Draw a deterministic-ish integer from the provided RNG.
             seed = int(rng.integers(0, 2**31 - 1))
         return int(seed), rng
 
     if seed is None:
-        # Generate a seed and record it, so outputs remain reproducible if re-run.
-        seed = int(np.random.SeedSequence().entropy)
+        # Generate a concrete integer seed (stable to record).
+        seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
     return int(seed), np.random.default_rng(int(seed))
 
 
+# ---------------------------------------------------------------------
+# Header copy with updated sample count (important correctness fix)
+# ---------------------------------------------------------------------
+def _copy_header_with_updated_nsamp(
+    src_hea: Path,
+    dst_hea: Path,
+    *,
+    new_record_name: Optional[str],
+    new_nsamp: int,
+) -> None:
+    """Copy a PhysioNet header, updating record name (optional) and n_samples if parseable."""
+    if not src_hea.exists():
+        return
+
+    try:
+        lines = src_hea.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    except Exception:
+        lines = src_hea.read_text(encoding="latin-1", errors="ignore").splitlines(True)
+
+    if not lines:
+        copyfile(src_hea, dst_hea)
+        return
+
+    first = lines[0].strip("\n")
+    parts = first.split()
+
+    # Typical: <rec> <n_sig> <fs> <n_samples> ...
+    if len(parts) >= 4 and parts[1].isdigit():
+        if new_record_name:
+            parts[0] = str(new_record_name)
+        # nsamp is commonly integer
+        try:
+            int(parts[3])
+            parts[3] = str(int(new_nsamp))
+        except Exception:
+            pass
+
+        lines[0] = " ".join(parts) + "\n"
+
+    dst_hea.write_text("".join(lines), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------
+# Beat selection + augmentation
+# ---------------------------------------------------------------------
 def _choose_non_edge_beat_index(
     x: np.ndarray,
     fs: float,
@@ -70,22 +157,24 @@ def _choose_non_edge_beat_index(
     lead_names: Sequence[str] = LEADS12,
     prefer: Sequence[str] = ("II", "V2", "V3"),
 ) -> int:
-    """Pick a beat index (by R-peak list index) while avoiding edge beats.
+    """Pick a beat index (index into R-peak list) while avoiding edge beats and clipping.
 
     Strategy:
-      1) Exclude the first/last `edge_beats` beats.
-      2) Filter to beats whose extraction window stays in-bounds (no clipping).
-      3) Fall back to the middle beat if candidates are empty.
+      1) Detect R-peaks.
+      2) Exclude first/last `edge_beats`.
+      3) Keep only beats whose extraction window [r-pre, r+post] stays in-bounds.
+      4) Fall back to the middle beat if candidates are empty.
     """
     x = np.asarray(x, dtype=np.float32)
     T = int(x.shape[0])
+
     r_idx = detect_rpeaks(x, fs, prefer=prefer, lead_names=lead_names)
     n = int(r_idx.size)
     if n == 0:
         raise ValueError("No R-peaks detected; cannot choose beat_index.")
 
-    lo = int(max(0, edge_beats))
-    hi = int(min(n, n - max(0, edge_beats)))
+    lo = max(0, int(edge_beats))
+    hi = min(n, n - int(edge_beats))
     candidates = list(range(lo, hi))
     if not candidates:
         return int(n // 2)
@@ -114,6 +203,22 @@ def add_extra_beat(
     prefer: Sequence[str] = ("II", "V2", "V3"),
     max_len: Optional[int] = None,
 ) -> np.ndarray:
+    """Duplicate one beat and insert it either in the middle or at the end.
+
+    Args:
+        x: ECG array (T, F) float.
+        fs: Sampling frequency.
+        location: "middle" inserts after the selected beat; "end" appends.
+        beat_index: index into the detected R-peak list. If None, chooses a sensible default.
+        pre_sec/post_sec: beat extraction window around R-peak.
+        max_len: if not None, truncate final signal to max_len samples.
+
+    Returns:
+        Augmented ECG array (T_new, F).
+    """
+    if location not in ("middle", "end"):
+        raise ValueError("location must be 'middle' or 'end'")
+
     x = np.asarray(x, dtype=np.float32)
     T, F = x.shape
 
@@ -124,10 +229,10 @@ def add_extra_beat(
     if beat_index is None:
         beat_index = int(len(r_idx) // 2) if location == "middle" else (len(r_idx) - 1)
 
-    if not (0 <= beat_index < len(r_idx)):
+    if not (0 <= int(beat_index) < int(len(r_idx))):
         raise IndexError(f"beat_index {beat_index} out of range for {len(r_idx)} beats.")
 
-    r = int(r_idx[beat_index])
+    r = int(r_idx[int(beat_index)])
     s = max(0, int(round(r - pre_sec * fs)))
     e = min(T, int(round(r + post_sec * fs)))
     if e <= s:
@@ -138,15 +243,21 @@ def add_extra_beat(
     insert_at = e if location == "middle" else T
     x_new = np.concatenate([x[:insert_at, :], beat_seg, x[insert_at:, :]], axis=0)
 
-    if max_len is not None and x_new.shape[0] > max_len:
-        x_new = x_new[:max_len, :]
+    if max_len is not None and x_new.shape[0] > int(max_len):
+        x_new = x_new[: int(max_len), :]
+
     return x_new
 
+
+# ---------------------------------------------------------------------
+# Beat matching (to ignore the extra beat)
+# ---------------------------------------------------------------------
 def _match_beats_by_time(
     r_sec_a: Sequence[float],
     r_sec_b: Sequence[float],
     max_diff_sec: float = 0.08,
 ) -> List[Tuple[int, int]]:
+    """Greedy matching of beats by timestamp; returns list of (idx_a, idx_b)."""
     r_a = np.asarray(r_sec_a, dtype=float)
     r_b = np.asarray(r_sec_b, dtype=float)
 
@@ -154,36 +265,41 @@ def _match_beats_by_time(
     used_b = set()
 
     for i, t in enumerate(r_a):
-        diffs = [(j, abs(float(r_b[j]) - float(t))) for j in range(len(r_b)) if j not in used_b]
-        if not diffs:
+        candidates = [(j, abs(float(r_b[j]) - float(t))) for j in range(len(r_b)) if j not in used_b]
+        if not candidates:
             break
-        j, dt = min(diffs, key=lambda p: p[1])
-        if dt <= max_diff_sec:
-            pairs.append((i, j))
-            used_b.add(j)
+        j, dt = min(candidates, key=lambda p: p[1])
+        if dt <= float(max_diff_sec):
+            pairs.append((int(i), int(j)))
+            used_b.add(int(j))
 
     return pairs
 
+
+# ---------------------------------------------------------------------
+# Stability metrics on aligned score vectors
+# ---------------------------------------------------------------------
 def _ranks_with_ties(values: np.ndarray) -> np.ndarray:
+    """Compute 1..n ranks with average ranks for ties."""
     values = np.asarray(values, dtype=float)
     n = values.size
     order = np.argsort(values)
     ranks = np.empty(n, dtype=float)
     ranks[order] = np.arange(1, n + 1, dtype=float)
+
     for v in np.unique(values):
         idx = np.where(values == v)[0]
         if idx.size > 1:
             ranks[idx] = ranks[idx].mean()
     return ranks
 
+
 def _effective_k(n: int, k: int = 20, k_frac: float = 0.10, k_min: int = 10) -> int:
-    """
-    Pick a K that scales with the number of regions.
-    Defaults: top 10%, at least 10, at most k.
-    """
+    """Pick K scaling with number of regions: top k_frac, at least k_min, at most k."""
     if n <= 0:
         return 0
-    return max(k_min, min(int(k), int(round(k_frac * n))))
+    return max(int(k_min), min(int(k), int(round(float(k_frac) * n))))
+
 
 def _topk_hard(scores: np.ndarray, k: int) -> set[int]:
     scores = np.asarray(scores, float)
@@ -194,10 +310,9 @@ def _topk_hard(scores: np.ndarray, k: int) -> set[int]:
     idx = np.argsort(scores)[::-1][:k]
     return set(idx.tolist())
 
+
 def _topk_tie_aware(scores: np.ndarray, k: int) -> set[int]:
-    """
-    Include all items with score >= score_at_rank_k (so ties at the boundary don't jitter).
-    """
+    """Include all items with score >= score_at_rank_k (ties don't jitter)."""
     scores = np.asarray(scores, float)
     n = scores.size
     if n == 0 or k <= 0:
@@ -216,23 +331,18 @@ def _jaccard(a: set[int], b: set[int]) -> float:
 
 
 def _weighted_jaccard(scores_a: np.ndarray, scores_b: np.ndarray, eps: float = 1e-12) -> float:
-    """
-    Overlap of attribution *mass* (0..1). More stable than top-K membership.
-    """
+    """Overlap of attribution mass (0..1). Often smoother than top-K membership."""
     a = np.maximum(np.asarray(scores_a, float), 0.0)
     b = np.maximum(np.asarray(scores_b, float), 0.0)
     if a.size == 0 or b.size != a.size:
         return float("nan")
     num = np.minimum(a, b).sum()
-    den = np.maximum(a, b).sum() + eps
+    den = np.maximum(a, b).sum() + float(eps)
     return float(num / den)
 
 
-def _rbo_from_scores(scores_a: np.ndarray, scores_b: np.ndarray, p: float = 0.90, k: int | None = None) -> float:
-    """
-    Rank-Biased Overlap (0..1), rank-sensitive stability.
-    p near 1.0 looks deeper into the ranking; p=0.9 is a common default.
-    """
+def _rbo_from_scores(scores_a: np.ndarray, scores_b: np.ndarray, p: float = 0.90, k: Optional[int] = None) -> float:
+    """Rank-Biased Overlap (0..1). p near 1 looks deeper into the ranking."""
     a = np.asarray(scores_a, float)
     b = np.asarray(scores_b, float)
     n = a.size
@@ -240,7 +350,7 @@ def _rbo_from_scores(scores_a: np.ndarray, scores_b: np.ndarray, p: float = 0.90
         return float("nan")
     if k is None:
         k = n
-    k = min(k, n)
+    k = min(int(k), n)
 
     ra = np.argsort(a)[::-1][:k]
     rb = np.argsort(b)[::-1][:k]
@@ -251,9 +361,9 @@ def _rbo_from_scores(scores_a: np.ndarray, scores_b: np.ndarray, p: float = 0.90
         seen_a.add(int(ra[d - 1]))
         seen_b.add(int(rb[d - 1]))
         overlap = len(seen_a & seen_b)
-        rbo_sum += (overlap / d) * (p ** (d - 1))
+        rbo_sum += (overlap / d) * (float(p) ** (d - 1))
 
-    return float((1 - p) * rbo_sum)
+    return float((1 - float(p)) * rbo_sum)
 
 
 def explanation_stability(
@@ -265,14 +375,15 @@ def explanation_stability(
     k_min: int = 10,
     rbo_p: float = 0.90,
 ) -> Dict[str, float]:
-    """
-    Returns:
-      - spearman
-      - jaccard_topk            (tie-aware)
-      - jaccard_topk_hard       (old behaviour)
-      - rbo                     (rank-sensitive)
-      - weighted_jaccard        (mass overlap)
-      - k_eff                   (actual K used)
+    """Compute several stability measures between two aligned score vectors.
+
+    Returns keys:
+        - spearman
+        - jaccard_topk            (tie-aware)
+        - jaccard_topk_hard       (hard top-K membership)
+        - rbo                     (rank-sensitive overlap)
+        - weighted_jaccard        (mass overlap)
+        - k_eff                   (actual K used)
     """
     s1 = np.asarray(scores_a, dtype=float)
     s2 = np.asarray(scores_b, dtype=float)
@@ -283,21 +394,19 @@ def explanation_stability(
             "jaccard_topk_hard": np.nan,
             "rbo": np.nan,
             "weighted_jaccard": np.nan,
-            "k_eff": 0,
+            "k_eff": 0.0,
         }
 
-    # Spearman (rank stability over all regions)
+    # Spearman over all regions (manual to avoid scipy dependency drift)
     r1 = _ranks_with_ties(s1)
     r2 = _ranks_with_ties(s2)
     r1c = r1 - r1.mean()
     r2c = r2 - r2.mean()
-    denom = (np.linalg.norm(r1c) * np.linalg.norm(r2c))
+    denom = float(np.linalg.norm(r1c) * np.linalg.norm(r2c))
     spearman = float(np.dot(r1c, r2c) / denom) if denom != 0 else np.nan
 
-    # Choose K adaptively
     k_eff = _effective_k(s1.size, k=k, k_frac=k_frac, k_min=k_min)
 
-    # Jaccard top-K (tie-aware + hard baseline)
     set1_h = _topk_hard(s1, k_eff)
     set2_h = _topk_hard(s2, k_eff)
     jacc_h = _jaccard(set1_h, set2_h)
@@ -306,7 +415,6 @@ def explanation_stability(
     set2_t = _topk_tie_aware(s2, k_eff)
     jacc_t = _jaccard(set1_t, set2_t)
 
-    # Extra stability metrics
     wj = _weighted_jaccard(s1, s2)
     rbo = _rbo_from_scores(s1, s2, p=rbo_p, k=k_eff)
 
@@ -319,7 +427,23 @@ def explanation_stability(
         "k_eff": float(k_eff),
     }
 
+
+# ---------------------------------------------------------------------
+# Region aggregation (lead × window_type × beat_index)
+# ---------------------------------------------------------------------
 def aggregate_scores_by_region(tokens, windows, r_sec, scores) -> Tuple[List[Tuple[str, str, int]], np.ndarray]:
+    """Aggregate token-level scores into region scores.
+
+    Region key: (lead_name, window_type, beat_index)
+
+    We map each token (lead, (start,end)) to:
+      - window_type via exact lookup in the per-type window lists
+      - beat_index via nearest R-peak time to token centre
+
+    Returns:
+      region_keys: sorted list of region keys
+      region_scores: array aligned with region_keys, normalized to max=1 if possible
+    """
     # map (start,end) -> window type
     win_map = {}
     for k, lst in (
@@ -353,6 +477,30 @@ def aggregate_scores_by_region(tokens, windows, r_sec, scores) -> Tuple[List[Tup
         region_scores /= region_scores.max()
     return region_keys, region_scores
 
+
+def _region_scores_from_payload(mat_path: str, fs: float, payload: Dict, class_name_eval: str) -> Tuple[List[Tuple[str, str, int]], np.ndarray, List[float]]:
+    """Compute normalized region scores for one record/payload."""
+    x = load_mat_TF(mat_path)
+
+    r_idx = detect_rpeaks(x, fs, prefer=("II", "V2", "V3"), lead_names=LEADS12)
+    r_sec = (r_idx / float(fs)).tolist()
+
+    cfg = REGISTRY[class_name_eval]
+    windows = build_windows_from_rpeaks(r_sec, class_name=class_name_eval)
+    tokens = build_tokens(LEADS12, windows, which=cfg.window_keys)
+
+    raw = payload.get("perlead_spans", {}) or {}
+    spans = {str(L): [(float(s), float(e), float(w)) for (s, e, w) in lst] for L, lst in raw.items()}
+
+    scores = integrate_attribution(spans, tokens)
+
+    # Apply priors (kept identical to your current logic)
+    scores = apply_all_priors(class_name_eval, tokens, windows, scores, alpha=0.8)
+
+    keys, reg_scores = aggregate_scores_by_region(tokens, windows, r_sec, scores)
+    return keys, reg_scores, r_sec
+
+
 def stability_with_extra_beat_regionwise(
     mat_path_a: str,
     mat_path_b: str,
@@ -360,44 +508,13 @@ def stability_with_extra_beat_regionwise(
     payload_a: Dict,
     payload_b: Dict,
     class_name_eval: str,
-    lead_names: Sequence[str] = LEADS12,
+    *,
     k: int = 20,
     beat_tolerance_sec: float = 0.08,
 ) -> Dict[str, float]:
-    x_a = load_mat_TF(mat_path_a)
-    x_b = load_mat_TF(mat_path_b)
-
-    r_idx_a = detect_rpeaks(x_a, fs, prefer=("II", "V2", "V3"), lead_names=lead_names)
-    r_idx_b = detect_rpeaks(x_b, fs, prefer=("II", "V2", "V3"), lead_names=lead_names)
-    r_sec_a = (r_idx_a / float(fs)).tolist()
-    r_sec_b = (r_idx_b / float(fs)).tolist()
-
-    cfg = REGISTRY[class_name_eval]
-
-    windows_a = build_windows_from_rpeaks(r_sec_a, class_name=class_name_eval)
-    tokens_a = build_tokens(lead_names, windows_a, which=cfg.window_keys)
-
-    windows_b = build_windows_from_rpeaks(r_sec_b, class_name=class_name_eval)
-    tokens_b = build_tokens(lead_names, windows_b, which=cfg.window_keys)
-
-    def _spans(payload: Dict) -> Dict[str, List[Tuple[float, float, float]]]:
-        raw = payload.get("perlead_spans", {})
-        return {str(L): [(float(s), float(e), float(w)) for (s, e, w) in spans] for L, spans in raw.items()}
-
-    spans_a = _spans(payload_a)
-    spans_b = _spans(payload_b)
-
-    scores_a = integrate_attribution(spans_a, tokens_a)
-    scores_a = apply_sinus_prior_blend(class_name_eval, tokens_a, windows_a, scores_a, alpha=0.8)
-    scores_a = apply_af_prior_blend(class_name_eval, tokens_a, windows_a, scores_a, alpha=0.8)
-    scores_a = apply_vpb_prior_blend(class_name_eval, tokens_a, windows_a, scores_a, alpha=0.8)
-    keys_a, reg_a = aggregate_scores_by_region(tokens_a, windows_a, r_sec_a, scores_a)
-
-    scores_b = integrate_attribution(spans_b, tokens_b)
-    scores_b = apply_sinus_prior_blend(class_name_eval, tokens_b, windows_b, scores_b, alpha=0.8)
-    scores_b = apply_af_prior_blend(class_name_eval, tokens_b, windows_b, scores_b, alpha=0.8)
-    scores_b = apply_vpb_prior_blend(class_name_eval, tokens_b, windows_b, scores_b, alpha=0.8)
-    keys_b, reg_b = aggregate_scores_by_region(tokens_b, windows_b, r_sec_b, scores_b)
+    """Compute stability between (A) original and (B) augmented while ignoring the extra beat."""
+    keys_a, reg_a, r_sec_a = _region_scores_from_payload(mat_path_a, fs, payload_a, class_name_eval)
+    keys_b, reg_b, r_sec_b = _region_scores_from_payload(mat_path_b, fs, payload_b, class_name_eval)
 
     beat_pairs = _match_beats_by_time(r_sec_a, r_sec_b, max_diff_sec=beat_tolerance_sec)
     if not beat_pairs:
@@ -414,8 +531,8 @@ def stability_with_extra_beat_regionwise(
     for ia, ib in beat_pairs:
         for lead in common_leads:
             for wt in common_wins:
-                ka = (lead, wt, ia)
-                kb = (lead, wt, ib)
+                ka = (lead, wt, int(ia))
+                kb = (lead, wt, int(ib))
                 if ka in reg_dict_a and kb in reg_dict_b:
                     aligned_a.append(float(reg_dict_a[ka]))
                     aligned_b.append(float(reg_dict_b[kb]))
@@ -425,6 +542,10 @@ def stability_with_extra_beat_regionwise(
 
     return explanation_stability(np.asarray(aligned_a), np.asarray(aligned_b), k=k)
 
+
+# ---------------------------------------------------------------------
+# Build a 2-row sel_df (original + augmented)
+# ---------------------------------------------------------------------
 def make_augmented_sel_df_for_one_record(
     mat_path: str,
     class_code: str,
@@ -432,43 +553,60 @@ def make_augmented_sel_df_for_one_record(
     *,
     seed: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
-    edge_beats: int = 1,
+    params: ExtraBeatParams = ExtraBeatParams(),
     maxlen: int = MAXLEN,
     out_root: Path = AUGMENT_ROOT,
     overwrite: bool = False,
 ) -> pd.DataFrame:
+    """Create selection df with original + augmented record stored under out_root/<stem>/."""
     mat_path = Path(mat_path)
-    rec_dir = out_root / mat_path.stem
+    rec_dir = Path(out_root) / mat_path.stem
     rec_dir.mkdir(parents=True, exist_ok=True)
 
     seed_used, rng_used = _init_rng(seed=seed, rng=rng)
 
     x_orig = load_mat_TF(str(mat_path))
+
     beat_index = _choose_non_edge_beat_index(
         x_orig,
         float(fs),
         rng_used,
-        edge_beats=int(edge_beats),
+        pre_sec=float(params.pre_sec),
+        post_sec=float(params.post_sec),
+        edge_beats=int(params.edge_beats),
+        prefer=params.prefer,
     )
+
     x_extra = add_extra_beat(
         x_orig,
         float(fs),
-        location="middle",
+        location=str(params.location),
         beat_index=int(beat_index),
-        max_len=maxlen,
+        pre_sec=float(params.pre_sec),
+        post_sec=float(params.post_sec),
+        max_len=int(maxlen),
     )
+
     suffix = f"_extra_seed{int(seed_used)}_beat{int(beat_index)}"
 
-    def _save_variant(x_tf: np.ndarray, suffix: str, sel_idx: int) -> Dict:
-        new_mat = rec_dir / f"{mat_path.stem}{suffix}{mat_path.suffix}"
+    def _save_variant(x_tf: np.ndarray, suffix_: str, sel_idx: int) -> Dict:
+        new_mat = rec_dir / f"{mat_path.stem}{suffix_}{mat_path.suffix}"
         if overwrite or (not new_mat.exists()):
-            savemat(new_mat, {"val": x_tf.T})
+            savemat(new_mat, {"val": np.asarray(x_tf, dtype=np.float32).T})
+
             src_hea = mat_path.with_suffix(".hea")
             dst_hea = new_mat.with_suffix(".hea")
+
             if src_hea.exists():
-                copyfile(src_hea, dst_hea)
+                _copy_header_with_updated_nsamp(
+                    src_hea,
+                    dst_hea,
+                    new_record_name=new_mat.stem,
+                    new_nsamp=int(x_tf.shape[0]),
+                )
+
         return {
-            "group_class": class_code,
+            "group_class": str(class_code),
             "filename": str(new_mat),
             "sel_idx": int(sel_idx),
             "augment_seed": int(seed_used),
@@ -477,7 +615,7 @@ def make_augmented_sel_df_for_one_record(
 
     rows = [
         {
-            "group_class": class_code,
+            "group_class": str(class_code),
             "filename": str(mat_path),
             "sel_idx": 0,
             "augment_seed": np.nan,
@@ -487,6 +625,10 @@ def make_augmented_sel_df_for_one_record(
     ]
     return pd.DataFrame(rows)
 
+
+# ---------------------------------------------------------------------
+# Public experiment runner
+# ---------------------------------------------------------------------
 def run_extra_beat_stability_experiment(
     mat_path: str,
     snomed_code: str,
@@ -495,13 +637,14 @@ def run_extra_beat_stability_experiment(
     *,
     seed: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
-    edge_beats: int = 1,
+    params: ExtraBeatParams = ExtraBeatParams(),
     overwrite: bool = False,
     maxlen: int = MAXLEN,
     beat_tolerance_sec: float = 0.08,
     k: int = 20,
     augment_root: Path = AUGMENT_ROOT,
 ) -> Tuple[Dict, pd.DataFrame, Dict, pd.DataFrame, pd.DataFrame]:
+    """Run the full original-vs-augmented stability experiment for one record + one SNOMED code."""
     hea_path, _ = ensure_paths(mat_path)
     fs, _ = parse_fs_and_leads(hea_path, default_fs=500.0)
 
@@ -511,7 +654,7 @@ def run_extra_beat_stability_experiment(
         fs=float(fs),
         seed=seed,
         rng=rng,
-        edge_beats=edge_beats,
+        params=params,
         maxlen=maxlen,
         out_root=augment_root,
         overwrite=bool(overwrite),
@@ -533,6 +676,7 @@ def run_extra_beat_stability_experiment(
     mat_path_p = Path(mat_path)
     mat_extra = Path(sel_df.loc[sel_df["sel_idx"] == 1, "filename"].iloc[0])
 
+    # REGISTRY uses human-readable names; TARGET_META maps SNOMED -> {"name": ...}
     class_name_eval = str(TARGET_META[str(snomed_code)]["name"])
 
     metrics_extra = stability_with_extra_beat_regionwise(
@@ -542,16 +686,24 @@ def run_extra_beat_stability_experiment(
         payload_a=payload_orig,
         payload_b=payload_extra,
         class_name_eval=class_name_eval,
-        k=k,
-        beat_tolerance_sec=beat_tolerance_sec,
+        k=int(k),
+        beat_tolerance_sec=float(beat_tolerance_sec),
     )
 
-    # Surface the augmentation choice in the return value, too.
     aug_row = sel_df.loc[sel_df["sel_idx"] == 1].iloc[0]
     metrics = {
         "extra": metrics_extra,
         "augment_seed": int(aug_row["augment_seed"]),
         "augment_beat_index": int(aug_row["augment_beat_index"]),
         "augmented_file": str(mat_extra),
+        "fs": float(fs),
+        "params": {
+            "location": params.location,
+            "pre_sec": params.pre_sec,
+            "post_sec": params.post_sec,
+            "edge_beats": params.edge_beats,
+            "prefer": list(params.prefer),
+        },
     }
+
     return metrics, sel_df, all_fused_payloads, df_lime_all, df_ts_all
