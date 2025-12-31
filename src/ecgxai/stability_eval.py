@@ -41,7 +41,7 @@ import pandas as pd
 from scipy.io import savemat
 
 from .config import MAXLEN
-from .preprocessing import ensure_paths, parse_fs_and_leads
+from .preprocessing import ensure_paths, parse_fs_and_leads, load_mat_TF
 
 from .config_targets import TARGET_META
 from .explainer import run_fused_pipeline_for_classes
@@ -57,11 +57,8 @@ from .eval import (
     apply_all_priors,
 )
 
-from preprocessing import load_mat_TF
-
 ROOT = Path.cwd().parent
 AUGMENT_ROOT = Path(ROOT / "outputs" / "extra_beat_aug")  # change if you want
-
 
 __all__ = [
     "AUGMENT_ROOT",
