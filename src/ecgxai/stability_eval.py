@@ -49,7 +49,6 @@ from .explainer import run_fused_pipeline_for_classes
 # Import what we need from eval.py (core)
 from .eval import (
     LEADS12,
-    load_mat_TF,
     detect_rpeaks,
     REGISTRY,
     build_windows_from_rpeaks,
@@ -57,6 +56,8 @@ from .eval import (
     integrate_attribution,
     apply_all_priors,
 )
+
+from preprocessing import load_mat_TF
 
 ROOT = Path.cwd().parent
 AUGMENT_ROOT = Path(ROOT / "outputs" / "extra_beat_aug")  # change if you want
