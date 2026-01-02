@@ -1,0 +1,7 @@
+meta_code,class_name,sel_idx,mat_path,seed,augment_beat_index,augmented_file,extra_spearman,extra_jaccard,extra_rbo,extra_wjacc,extra_k_eff
+164889003,atrial fibrillation,3954,C:\UHull\Data\Training_WFDB\A0850.mat,1484973458,12,c:\UHull\ecg-xai\outputs\extra_beat_aug\A0850\A0850_extra_seed1484973458_beat12.mat,0.9394908260022429,0.5384615384615384,0.3542243129441294,0.9586559326433042,20.0
+164889003,atrial fibrillation,7920,C:\UHull\Data\Training_WFDB\A4816.mat,3357105374,1,c:\UHull\ecg-xai\outputs\extra_beat_aug\A4816\A4816_extra_seed3357105374_beat1.mat,0.9402002861230327,1.0,0.46113016047428573,0.9469264800854195,10.0
+164889003,atrial fibrillation,8285,C:\UHull\Data\Training_WFDB\A5181.mat,67408971,12,c:\UHull\ecg-xai\outputs\extra_beat_aug\A5181\A5181_extra_seed67408971_beat12.mat,0.85401950382629,0.16129032258064516,0.09265986414868886,0.9029645378386131,18.0
+426783006,sinus rhythm,9042,C:\UHull\Data\WFDB\HR00120.mat,2831083760,2,c:\UHull\ecg-xai\outputs\extra_beat_aug\HR00120\HR00120_extra_seed2831083760_beat2.mat,0.8389324164591259,1.0,0.5879051604742856,0.8975840494322229,10.0
+426783006,sinus rhythm,11786,C:\UHull\Data\WFDB\HR02864.mat,286412424,6,c:\UHull\ecg-xai\outputs\extra_beat_aug\HR02864\HR02864_extra_seed286412424_beat6.mat,0.942035719625234,1.0,0.42400847648285706,0.9748896752012981,10.0
+426783006,sinus rhythm,12105,C:\UHull\Data\WFDB\HR03183.mat,3221927589,2,c:\UHull\ecg-xai\outputs\extra_beat_aug\HR03183\HR03183_extra_seed3221927589_beat2.mat,0.9453767827135499,0.391304347826087,0.3434913844403351,0.9480731895348846,16.0

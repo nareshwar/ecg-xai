@@ -1,11 +1,10 @@
 {
   "mode": "demo",
-  "saved_at": "2025-12-17T00:20:34",
+  "saved_at": "2026-01-02T14:06:34",
   "target_classes": [
     "164889003",
-    "426783006",
-    "17338001"
+    "426783006"
   ],
   "max_examples_per_class": 3,
-  "plot": false
+  "plot": true
 }

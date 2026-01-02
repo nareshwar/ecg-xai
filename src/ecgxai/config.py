@@ -36,7 +36,6 @@ class Settings:
     random_seed: int = RANDOM_SEED
     data_root: Path = DATA_ROOT
 
-
 def get_settings() -> Settings:
     """Return a frozen Settings object representing the active configuration."""
     return Settings()
