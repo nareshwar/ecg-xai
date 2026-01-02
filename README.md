@@ -1,322 +1,263 @@
 # ECG-XAI
 
-Explainability toolkit for 12-lead ECG classifiers. The repo bundles LIME-style perturbation explanations, a TimeSHAP-inspired variant, fusion logic to combine them, plotting utilities, and automatic evaluation metrics (token-level AttAUC/F1 and deletion-based faithfulness). It targets PhysioNet-style ECG records (.mat/.hea) and Keras/TF models that output SNOMED-coded probabilities.
+Explainability toolkit for 12-lead ECG classifiers. The repo bundles LIME-style perturbation explanations, a TimeSHAP-inspired variant, fusion logic to combine them, plotting utilities, and automatic evaluation metrics (token-level AttAUC and deletion-based faithfulness). It targets PhysioNet-style ECG records (.mat/.hea) and Keras/TF models that output SNOMED-coded probabilities.
 
-## Repository Layout
-- src/: core library
-  - preprocessing.py: load PhysioNet records, pad/truncate to MAXLEN
-  - ecg_predict.py: batched model inference
-  - selection.py: pick high-confidence examples per diagnosis (with duration filter)
-  - ecg_lime.py, ecg_timeshap.py: event + per-lead attributions
-  - explainer.py: class-aware pipelines (LIME-only or fused LIME+TimeSHAP)
-  - fusion.py: merge two payloads lead-wise and time-wise
-  - payload.py: convert rows -> plotting payloads
-  - plot.py: render ECG plus shaded spans using ecg_plot
-  - eval.py: ground-truth windows, AttAUC/F1, deletion AUC
-  - config.py, config_targets.py: global constants and meta-class definitions
-- data/: example metadata (ecg_model_pred_data.csv, snomed_classes.npy)
-- model/: example Keras model weights (resnet_final.keras, resnet_final_weights.h5)
-- notebook/ecg-xai.ipynb: interactive walkthrough/staging area
-- README.md: (this file)
+This repo has two “runner” notebooks that cover the same end‑to‑end workflow (select → explain → fuse → evaluate → stability),
+but in two different environments:
 
-## Requirements
-- Python >= 3.10
-- Packages: numpy, pandas, scipy, scikit-learn, tensorflow/keras, tqdm, matplotlib, ecg_plot
-- Data format: PhysioNet-style .mat with val key (12xT) plus matching .hea
-- Defaults: MAXLEN=5000, RANDOM_SEED=42, DATA_ROOT='C:/data/'
+- **`ecg-xai-kaggle.ipynb`**: a Kaggle‑friendly demo/eval runner (uses Kaggle Inputs + `/kaggle/working` caches).
+- **`ecg-xai-local.ipynb`**: a local runner (assumes you’re running from `notebook/` inside the repo).
 
-Install (example):
-```bash
-python -m venv .venv
-.\.venv\Scripts\activate   # on Windows; use source .venv/bin/activate on *nix
-pip install --upgrade pip
-pip install numpy pandas scipy scikit-learn tensorflow keras tqdm matplotlib ecg_plot
-```
+---
 
-## Quickstart Workflow
-1) Load class names and model
-```python
-import numpy as np
-from tensorflow import keras
+## Notebook 1 — `ecg-xai-kaggle.ipynb` (Kaggle runner)
 
-class_names = np.load("data/snomed_classes.npy", allow_pickle=True)
-model = keras.models.load_model("model/resnet_final.keras")
-```
+### What it’s for
+Run the ECG‑XAI pipeline on Kaggle with minimal setup:
+1) clone + install the repo,
+2) load a pretrained model + precomputed arrays from Kaggle Inputs,
+3) build/load `sel_df`,
+4) generate **LIME**, **TimeSHAP**, and **fused** explanations,
+5) compute evaluation metrics + **extra‑beat stability**,
+6) write outputs to `/kaggle/working/outputs`.
 
-2) Predict on ECGs
-```python
-from ecg_predict import batched_predict_all
+### Inputs you must provide (Kaggle “Datasets” as Inputs)
+The notebook expects **two Kaggle Inputs** mounted under `/kaggle/input/`:
 
-ecg_files = [...]  # list of .mat paths
-probs = batched_predict_all(model, ecg_files, batch_size=16, maxlen=5000)
-```
+#### 1) Input: `metadata`  → `/kaggle/input/metadata/`
+Required files:
+- `ecg_filenames.npy` — list/array of paths to PhysioNet records (usually `.mat` paths).
+- `ecg_model_probs.npy` — model probabilities, shape `(N, C)`.
+- `ecg_y_true.npy` — ground truth multi‑hot labels, shape `(N, C)`.
+- `snomed_classes.npy` — class codes in the same order as model outputs.
 
-3) Select examples per target diagnosis
-```python
-from selection import build_selection_df_with_aliases
-from config_targets import TARGET_META  # meta-classes and aliases
+Optional:
+- `sel_df_cache.npz` — prebuilt selection cache (speeds up reruns).
 
-sel_df = build_selection_df_with_aliases(
-    ecg_filenames=ecg_files,
-    probs=probs,
-    class_names=class_names,
-    target_meta=TARGET_META,   # e.g., AF group
-    k_per_class=5,
-    min_prob=0.85,
-    max_duration_sec=20.0,
-    duration_cache_path="durations.npy",
-)
-```
-sel_df needs at least group_class (target code), filename (.mat path), and sel_idx (index).
+#### 2) Input: `resnet` → `/kaggle/input/resnet/`
+Required file (either is fine):
+- `keras/default/1/resnet_final.keras` **or**
+- `keras/default/1/resnet_final.h5`
 
-4) Run explanations
-- LIME-only:
-```python
-from explainer import run_pipeline_for_classes
+> The notebook includes a small compatibility helper that renames a “mislabelled `.keras` that is actually HDF5” into a `.h5`
+> file before calling `tf.keras.models.load_model(..., compile=False)`.
 
-target_classes = list(TARGET_META.keys())  # e.g., ["164889003"]
-payloads_by_class, df_lime = run_pipeline_for_classes(
-    target_classes,
-    sel_df,
-    model=model,
-    class_names=class_names,
-    max_examples_per_class=3,
-    plot=False,
-)
-```
-- Fused LIME + TimeSHAP:
-```python
-from explainer import run_fused_pipeline_for_classes
+### Outputs (written to `/kaggle/working`)
+- `/kaggle/working/cache/`
+  - `sel_df_cache.npz` (selection cache)
+  - `ecg_durations.npy` (duration cache for filtering)
+- `/kaggle/working/outputs/`
+  - `ecg_xai_sel_meta.csv` (the selected examples per class)
+  - `df_eval_attauc_deletion.csv` (token‑level plausibility + deletion faithfulness)
+  - `df_eval_stability.csv` (extra‑beat stability metrics)
+  - `extra_beat_aug/` (augmented `.mat` files and any experiment artifacts)
 
-fused_payloads, df_lime, df_ts = run_fused_pipeline_for_classes(
-    target_classes,
-    sel_df,
-    model=model,
-    class_names=class_names,
-    max_examples_per_class=3,
-    plot=False,
-)
-```
-Each payload is keyed by val_idx/sel_idx and stores time/lead spans plus scores.
+### The workflow (matches the notebook section headers)
 
-5) Plot a payload
-```python
-from plot import plot_from_payload
+#### 0) Configuration (the only cell you usually edit)
+`RunConfig` supports:
+- `run_mode`: `"demo"` or `"eval"`
+- `seed`: base seed (also used to derive per‑record stability seeds)
+- `force_recompute_sel_df`: rebuild selection even if cache exists
+- `max_examples_per_class`: demo cap (auto‑set to 50 in eval mode)
+- `plot`: plot fused payloads inline (auto‑off in eval mode)
 
-payload = list(fused_payloads["164889003"].values())[0]
-plot_from_payload(payload, topk=5, show_all_leads=False)
-```
+#### 1) Clone & install
+- Clones the repo to `/kaggle/working/ecg-xai`
+- Installs the project with `pip install . --no-deps` to avoid Kaggle image dependency churn
+- Installs `ecg-plot` + `kaleido` for plotting/export
 
-6) Evaluate explanations
-```python
-from eval import evaluate_all_payloads
+#### 2) Imports + GPU sanity check
+- Imports TensorFlow with init logs redirected to `/kaggle/working/tf_init.log`
+- Prints TF version + visible GPUs
 
-df_metrics = evaluate_all_payloads(
-    fused_payloads,
-    method_label="fused",
-    model=model,
-    class_names=class_names,
-    debug=False,
-)
-```
-Metrics reported per ECG: strict/lenient AttAUC, strict/lenient F1, deletion AUC, faithfulness gain, token count.
+#### 3) Paths + input validation
+- Defines all paths for:
+  - Kaggle inputs (`/kaggle/input/metadata`, `/kaggle/input/resnet`)
+  - Working caches (`/kaggle/working/cache`)
+  - Outputs (`/kaggle/working/outputs`)
+- Fails fast with a clear `FileNotFoundError` if required input files are missing.
 
-## Payload Format (plotting and evaluation)
-A payload dict contains:
-- mat_path: path to the ECG record (.mat)
-- target_label: text for titles (for example, "atrial fibrillation")
-- method_label: "LIME", "TimeSHAP", or "fused"
-- page_seconds: duration plotted
-- perlead_spans: {lead: [(start_sec, end_sec, weight), ...]}
-- lead_scores: optional aggregate per lead
-- top5_leads: ordered lead list used for plotting focus
+#### 4) Load model + metadata arrays
+- Loads the model (`compile=False`)
+- Loads arrays: filenames / probs / y_true / class_names
 
-payload_from_lime_row / payload_from_timeshap_row build these from the per-ECG rows returned by the explainers. fuse_lime_timeshap_payload merges two payloads with overlap-aware weighting (agg, beta, tau, sign_policy, method_weights, etc.).
+#### 5) Build or load `sel_df`
+`sel_df` is the “selection dataframe” that drives the rest of the notebook.
+- If a working cache exists: load `sel_df_cache.npz`
+- Else if an input cache exists: load it and copy to working
+- Else: build from scratch using:
+  - `build_selection_df_with_aliases(..., k_per_class=50, min_prob=0.85, max_duration_sec=20.0, duration_cache_path=...)`
+- Saves `ecg_xai_sel_meta.csv` for inspection.
 
-## Customization
-- Lead priors and windowing: tweak explainer.py (LEAD_PRIOR_BY_SNOMED, WINDOW_SEC_BY_SNOMED, BASE_WINDOW_SEC). Lower window_sec to focus on PR/QRS; raise to cover longer beats.
-- Event segmentation: ecg_lime.make_event_segments currently supports uniform windows; extend for beat/QRS families if needed.
-- Class registry and aliases: edit config_targets.py to add meta-classes and SNOMED aliases; expand TARGET_META and the evaluator REGISTRY (in eval.py) if you add diagnoses.
-- Preprocessing: adjust MAXLEN/DATA_ROOT in config.py to match your model training setup.
-- Model I/O: preprocess_for_model pads/truncates to (T=MAXLEN, F=12) using keras.preprocessing.sequence.pad_sequences; replace if your model expects a different input format.
+#### 5.1) “Single example” demo helper
+Defines a `run_demo_for_class(<SNOMED_CODE>)` helper that:
+- picks a representative record for a given class (e.g., AF or sinus rhythm),
+- runs LIME + TimeSHAP on that record,
+- fuses the results,
+- optionally plots,
+- returns a small one‑row summary you can display.
 
-## Data Notes
-- Expects 12-lead signals with sampling frequency in the .hea first line; falls back to 500 Hz if missing.
-- selection.build_selection_df_with_aliases can enforce a duration cap via the header nsamp/fs.
-- Example metadata (data/ecg_model_pred_data.csv) shows the expected columns (group_class, sel_idx, filename, prob_group_class, etc.).
+#### 6) Run LIME + TimeSHAP + fused explanations (full run)
+- **6.1 LIME**: loops over `target_classes = list(TARGET_META.keys())`,
+  uses `default_explainer_config(cls)` to get per‑class windows/priors,
+  then calls `run_lime_for_one_class_from_sel(...)`.
+- **6.2 TimeSHAP**: same pattern via `run_timeshap_for_one_class_from_sel(...)` (uses `link="logit"`).
+- **6.3 Fusion**:
+  - aligns LIME and TimeSHAP rows by `val_idx`,
+  - builds payloads with `payload_from_lime_row(...)` and `payload_from_timeshap_row(...)`,
+  - fuses via `fuse_lime_timeshap_payload(...)` (default in notebook: `agg="geomean", beta=1.0, tau=0.02, topk=5`)
+  - applies optional per‑class `method_weights` (example: sinus rhythm gets `(0.7, 0.3)`).
 
-## Evaluation Details
-- Uses heart-rate-adaptive diagnostic windows around detected R-peaks (BeatWindows).
-- Per-class ground truth windows/leads live in eval.REGISTRY; strict vs lenient lead sets are supported.
-- AttAUC: ranking-based area under attention-vs-ground-truth curve (strict/lenient by lead set).
-- F1: thresholded token-level precision/recall.
-- Deletion AUC: faithfulness metric by iteratively masking high-importance spans and re-predicting.
+> Tip: Kaggle Inputs are read‑only. If you want to **save** `df_lime_all.pkl`, `df_ts_all.pkl`, or fused payloads,
+> write them under `/kaggle/working/cache` or `/kaggle/working/outputs` (not under `/kaggle/input/...`).
 
-## Troubleshooting
-- Missing or mismatched .hea files -> defaults to 500 Hz and may skip duration filtering.
-- Low-segmentation density -> increase m_event / m_feat (more masks) or raise topk_events.
-- Plotting issues -> ensure ecg_plot is installed and the .mat contains a val key shaped (12, T).
+#### 7) Evaluate explanations
+Runs:
+- `evaluate_all_payloads(all_payloads=all_fused_payloads, method_label="LIME+TimeSHAP", model=model, class_names=class_names)`
+and writes:
+- `df_eval_attauc_deletion.csv`
 
-## Notebook
-Use notebook/ecg-xai.ipynb to prototype end-to-end: load a model, run selection, generate explanations, plot, and score metrics.
-# ECG-XAI
+#### 8) Extra‑beat stability experiment
+For each evaluated record:
+- creates a deterministic seed using `CFG.seed XOR crc32(mat_path)`
+- calls `run_extra_beat_stability_experiment(...)` which:
+  - generates an “extra heartbeat” augmented record,
+  - reruns explanations,
+  - compares explanation stability (e.g., Spearman / Jaccard / RBO variants)
+- writes:
+  - `df_eval_stability.csv`
 
-Explainability toolkit for 12-lead ECG classifiers. The repo bundles LIME-style perturbation explanations, a TimeSHAP-inspired variant, fusion logic to combine them, plotting utilities, and automatic evaluation metrics (token-level AttAUC/F1 and deletion-based faithfulness). It targets PhysioNet-style ECG records (.mat/.hea) and Keras/TF models that output SNOMED-coded probabilities.
+#### 9) Per‑class summary
+Aggregates stability metrics per `(meta_code, class_name)`:
+- count + mean/std for key metrics.
 
-## Repository Layout
-- src/: core library
-  - preprocessing.py: load PhysioNet records, pad/truncate to MAXLEN
-  - ecg_predict.py: batched model inference
-  - selection.py: pick high-confidence examples per diagnosis (with duration filter)
-  - ecg_lime.py, ecg_timeshap.py: event + per-lead attributions
-  - explainer.py: class-aware pipelines (LIME-only or fused LIME+TimeSHAP)
-  - fusion.py: merge two payloads lead-wise and time-wise
-  - payload.py: convert rows -> plotting payloads
-  - plot.py: render ECG plus shaded spans using ecg_plot
-  - eval.py: ground-truth windows, AttAUC/F1, deletion AUC
-  - config.py, config_targets.py: global constants and meta-class definitions
-- data/: example metadata (ecg_model_pred_data.csv, snomed_classes.npy)
-- model/: example Keras model weights (resnet_final.keras, resnet_final_weights.h5)
-- notebook/ecg-xai.ipynb: interactive walkthrough/staging area
-- README.md: (this file)
+### Common tweaks (quick and safe)
+- **Faster demo:** `run_mode="demo"`, `max_examples_per_class=1`, `plot=False`
+- **More coverage:** `run_mode="eval"` (auto: 50 per class, plots off)
+- **Selection strictness:** raise `min_prob` (e.g., 0.90) or reduce `max_duration_sec`
+- **Fusion behavior:** change `agg`, `beta`, `tau`, `topk`, and per‑class `method_weights`
 
-## Requirements
-- Python >= 3.10
-- Packages: numpy, pandas, scipy, scikit-learn, tensorflow/keras, tqdm, matplotlib, ecg_plot
-- Data format: PhysioNet-style .mat with val key (12xT) plus matching .hea
-- Defaults: MAXLEN=5000, RANDOM_SEED=42, DATA_ROOT='C:/data/'
+---
 
-Install (example):
-```bash
-python -m venv .venv
-.\.venv\Scripts\activate   # on Windows; use source .venv/bin/activate on *nix
-pip install --upgrade pip
-pip install numpy pandas scipy scikit-learn tensorflow keras tqdm matplotlib ecg_plot
-```
+## Notebook 2 — `ecg-xai-local.ipynb` (Local runner)
 
-## Quickstart Workflow
-1) Load class names and model
-```python
-import numpy as np
-from tensorflow import keras
+### What it’s for
+Run the same pipeline locally (or in a local Jupyter environment) against either:
+- the repo’s **sample data** (`data/sample`), or
+- your own PhysioNet‑style dataset (by pointing `ECGXAI_DATA_ROOT` to it).
 
-class_names = np.load("data/snomed_classes.npy", allow_pickle=True)
-model = keras.models.load_model("model/resnet_final.keras")
-```
+It includes an optional “precompute arrays” stage (probabilities + labels) so you can reproduce the `metadata` artifacts that
+the Kaggle notebook expects.
 
-2) Predict on ECGs
-```python
-from ecg_predict import batched_predict_all
+### Assumed working directory
+This notebook is written as if you open it from the repo’s **`notebook/`** folder:
 
-ecg_files = [...]  # list of .mat paths
-probs = batched_predict_all(model, ecg_files, batch_size=16, maxlen=5000)
-```
+- It does `sys.path.append('../src')`
+- It uses `ROOT = Path.cwd().parent` (so `ROOT` becomes the repo root)
 
-3) Select examples per target diagnosis
-```python
-from selection import build_selection_df_with_aliases
-from config_targets import TARGET_META  # meta-classes and aliases
+### Key paths / artifacts
+The notebook defines:
+- **Data root**
+  - `SAMPLE_ROOT = ROOT / "data" / "sample"`
+  - `os.environ["ECGXAI_DATA_ROOT"] = str(SAMPLE_ROOT)`
+  - then reloads `ecgxai.config` so it picks up the env var.
+- **Model**
+  - `MODEL_PATH = ROOT / "model" / "resnet_final.h5"`
+- **Metadata artifacts (saved locally)**
+  - `data/ecg_filenames.npy`
+  - `data/ecg_model_probs.npy`
+  - `data/ecg_y_true.npy`
+  - `data/snomed_classes.npy`
+  - `data/ecg_durations.npy`
+- **Outputs**
+  - `outputs/<run_mode>/...` (cached runs)
+  - plus summary CSVs under `outputs/<run_mode>/`
 
-sel_df = build_selection_df_with_aliases(
-    ecg_filenames=ecg_files,
-    probs=probs,
-    class_names=class_names,
-    target_meta=TARGET_META,   # e.g., AF group
-    k_per_class=5,
-    min_prob=0.85,
-    max_duration_sec=20.0,
-    duration_cache_path="durations.npy",
-)
-```
-sel_df needs at least group_class (target code), filename (.mat path), and sel_idx (index).
+### The workflow (matches the notebook cells)
 
-4) Run explanations
-- LIME-only:
-```python
-from explainer import run_pipeline_for_classes
+#### 0) Install in editable mode
+Runs:
+- `%pip install -e ..`
+so your notebook always uses your current working tree.
 
-target_classes = list(TARGET_META.keys())  # e.g., ["164889003"]
-payloads_by_class, df_lime = run_pipeline_for_classes(
-    target_classes,
-    sel_df,
-    model=model,
-    class_names=class_names,
-    max_examples_per_class=3,
-    plot=False,
-)
-```
-- Fused LIME + TimeSHAP:
-```python
-from explainer import run_fused_pipeline_for_classes
+#### 1) Imports
+Imports the same “runner” utilities as the Kaggle notebook:
+- selection builder (`build_selection_df_with_aliases`)
+- fused pipeline (`run_fused_pipeline_for_classes`)
+- evaluation (`evaluate_all_payloads`)
+- extra‑beat stability (`run_extra_beat_stability_experiment`)
+- plus `save_run` / `load_run` helpers
 
-fused_payloads, df_lime, df_ts = run_fused_pipeline_for_classes(
-    target_classes,
-    sel_df,
-    model=model,
-    class_names=class_names,
-    max_examples_per_class=3,
-    plot=False,
-)
-```
-Each payload is keyed by val_idx/sel_idx and stores time/lead spans plus scores.
+#### 2) Point the project at the data + load the model
+- sets `ECGXAI_DATA_ROOT`
+- reloads config
+- loads the Keras model (`compile=False`)
+- loads `class_names`
 
-5) Plot a payload
-```python
-from plot import plot_from_payload
+#### 3) (Optional) Build `y_true` + run model inference locally
+If you want to regenerate the `metadata` arrays from raw sample data:
+- `import_key_data(DATA_ROOT)` loads demographics + labels + filenames
+- `build_y_true_from_labels(labels, class_names)` makes multi‑hot ground truth
+- `batched_predict_all(model, ecg_filenames, maxlen=MAXLEN, batch_size=32)` computes probabilities
+- saves `.npy` files into `data/`
 
-payload = list(fused_payloads["164889003"].values())[0]
-plot_from_payload(payload, topk=5, show_all_leads=False)
-```
+> If you already have `ecg_model_probs.npy` and `ecg_y_true.npy`, you can skip this section.
 
-6) Evaluate explanations
-```python
-from eval import evaluate_all_payloads
+#### 4) Build `sel_df`
+Loads arrays from disk and builds `sel_df` via:
+- `build_selection_df_with_aliases(..., k_per_class=50, min_prob=0.85, max_duration_sec=20.0, duration_cache_path=...)`
+Then saves:
+- `outputs/ecg_xai_sel_meta_p0.85_k5.csv` (path name reflects the selection params)
 
-df_metrics = evaluate_all_payloads(
-    fused_payloads,
-    method_label="fused",
-    model=model,
-    class_names=class_names,
-    debug=False,
-)
-```
-Metrics reported per ECG: strict/lenient AttAUC, strict/lenient F1, deletion AUC, faithfulness gain, token count.
+#### 5) Choose run mode + caching
+Two modes:
+- `run_mode="demo"` → `max_examples_per_class=3`, `plot=True`
+- `run_mode="eval"` → `max_examples_per_class=50`, `plot=False`
 
-## Payload Format (plotting and evaluation)
-A payload dict contains:
-- mat_path: path to the ECG record (.mat)
-- target_label: text for titles (for example, "atrial fibrillation")
-- method_label: "LIME", "TimeSHAP", or "fused"
-- page_seconds: duration plotted
-- perlead_spans: {lead: [(start_sec, end_sec, weight), ...]}
-- lead_scores: optional aggregate per lead
-- top5_leads: ordered lead list used for plotting focus
+Then:
+- checks for cached assets under `outputs/<run_mode>/`
+- if present: `load_run(RUN_DIR)`
+- else: runs `run_fused_pipeline_for_classes(...)` and saves via `save_run(...)`
 
-payload_from_lime_row / payload_from_timeshap_row build these from the per-ECG rows returned by the explainers. fuse_lime_timeshap_payload merges two payloads with overlap-aware weighting (agg, beta, tau, sign_policy, method_weights, etc.).
+Finally it caps `sel_df` to `max_examples_per_class` per class (so later steps stay consistent).
 
-## Customization
-- Lead priors and windowing: tweak explainer.py (LEAD_PRIOR_BY_SNOMED, WINDOW_SEC_BY_SNOMED, BASE_WINDOW_SEC). Lower window_sec to focus on PR/QRS; raise to cover longer beats.
-- Event segmentation: ecg_lime.make_event_segments currently supports uniform windows; extend for beat/QRS families if needed.
-- Class registry and aliases: edit config_targets.py to add meta-classes and SNOMED aliases; expand TARGET_META and the evaluator REGISTRY (in eval.py) if you add diagnoses.
-- Preprocessing: adjust MAXLEN/DATA_ROOT in config.py to match your model training setup.
-- Model I/O: preprocess_for_model pads/truncates to (T=MAXLEN, F=12) using keras.preprocessing.sequence.pad_sequences; replace if your model expects a different input format.
+#### 6) LIME / TimeSHAP / Fusion
+Same pattern as Kaggle:
+- `default_explainer_config(cls)` provides per‑class settings
+- runs LIME and TimeSHAP stages
+- fuses with `fuse_lime_timeshap_payload(...)`
+- plots with `plot_from_payload(...)` if enabled
 
-## Data Notes
-- Expects 12-lead signals with sampling frequency in the .hea first line; falls back to 500 Hz if missing.
-- selection.build_selection_df_with_aliases can enforce a duration cap via the header nsamp/fs.
-- Example metadata (data/ecg_model_pred_data.csv) shows the expected columns (group_class, sel_idx, filename, prob_group_class, etc.).
+#### 7) Evaluate
+Writes:
+- `outputs/<run_mode>/df_eval_attauc_deletion.csv`
 
-## Evaluation Details
-- Uses heart-rate-adaptive diagnostic windows around detected R-peaks (BeatWindows).
-- Per-class ground truth windows/leads live in eval.REGISTRY; strict vs lenient lead sets are supported.
-- AttAUC: ranking-based area under attention-vs-ground-truth curve (strict/lenient by lead set).
-- F1: thresholded token-level precision/recall.
-- Deletion AUC: faithfulness metric by iteratively masking high-importance spans and re-predicting.
+#### 8) Extra‑beat stability
+Writes:
+- `outputs/<run_mode>/df_eval_stability.csv`
+and generates augmented records under:
+- `outputs/extra_beat_aug/` (or the configured stability output dir)
 
-## Troubleshooting
-- Missing or mismatched .hea files -> defaults to 500 Hz and may skip duration filtering.
-- Low-segmentation density -> increase m_event / m_feat (more masks) or raise topk_events.
-- Plotting issues -> ensure ecg_plot is installed and the .mat contains a val key shaped (12, T).
+#### 9) Per‑class stability summary
+Aggregates stability metrics (count + means/stats) per class.
 
-## Notebook
-Use notebook/ecg-xai.ipynb to prototype end-to-end: load a model, run selection, generate explanations, plot, and score metrics.
+### Common local tweaks
+- Use your own dataset:
+  - set `os.environ["ECGXAI_DATA_ROOT"]` to your PhysioNet‑style root
+  - ensure the loader can find `.mat` + `.hea` pairs
+- Speed up:
+  - reduce `batch_size` in `batched_predict_all`
+  - reduce `k_per_class`, increase `min_prob`, lower `max_examples_per_class`
+- Plot control:
+  - `MODE_CFG["demo"]["plot"] = False` for faster/cleaner runs
+
+---
+
+## Glossary (quick)
+- **`sel_df`**: selection DataFrame containing the subset of records you’ll explain (typically high‑confidence picks per target class).
+- **`TARGET_META`**: mapping of target SNOMED codes to human names + aliases (meta‑classes).
+- **Payload**: a plotting/evaluation‑friendly dict containing lead×time spans + weights (from LIME/TimeSHAP or fused).
+- **AttAUC / F1 (token‑level)**: plausibility metrics comparing “what the explainer highlights” vs clinically plausible lead/window tokens.
+- **Deletion AUC**: faithfulness metric based on removing highlighted regions and measuring prediction drop.
+- **Extra‑beat stability**: how consistent explanations remain under a controlled augmentation that inserts a heartbeat.
