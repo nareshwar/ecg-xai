@@ -2,6 +2,8 @@
 
 Explainability toolkit for 12-lead ECG classifiers. The repo bundles LIME-style perturbation explanations, a TimeSHAP-inspired variant, fusion logic to combine them, plotting utilities, and automatic evaluation metrics (token-level AttAUC and deletion-based faithfulness). It targets PhysioNet-style ECG records (.mat/.hea) and Keras/TF models that output SNOMED-coded probabilities.
 
+# ECG‑XAI notebook guides
+
 This repo has two “runner” notebooks that cover the same end‑to‑end workflow (select → explain → fuse → evaluate → stability),
 but in two different environments:
 
@@ -23,6 +25,11 @@ Run the ECG‑XAI pipeline on Kaggle with minimal setup:
 
 ### Inputs you must provide (Kaggle “Datasets” as Inputs)
 The notebook expects **two Kaggle Inputs** mounted under `/kaggle/input/`:
+
+**Also required:** the raw ECG record dataset (PhysioNet‑style `.hea`/`.mat`). `ecg_filenames.npy` contains file paths that should resolve to those records on Kaggle, so you must attach the dataset that provides the `.hea`/`.mat` files as an Input as well (see the companion Kaggle notebook for how the datasets are wired).
+
+Companion Kaggle notebook (shows the configured dataset Inputs):
+- `https://www.kaggle.com/code/nareshuhull/ecg-xai`
 
 #### 1) Input: `metadata`  → `/kaggle/input/metadata/`
 Required files:
@@ -144,7 +151,7 @@ Aggregates stability metrics per `(meta_code, class_name)`:
 
 ### What it’s for
 Run the same pipeline locally (or in a local Jupyter environment) against either:
-- the repo’s **sample data** (`data/sample`), or
+- the repo’s **sample data** (`data/sample`) — includes **50 AF** + **50 SNR** records for quick local runs, or
 - your own PhysioNet‑style dataset (by pointing `ECGXAI_DATA_ROOT` to it).
 
 It includes an optional “precompute arrays” stage (probabilities + labels) so you can reproduce the `metadata` artifacts that
@@ -261,3 +268,5 @@ Aggregates stability metrics (count + means/stats) per class.
 - **AttAUC / F1 (token‑level)**: plausibility metrics comparing “what the explainer highlights” vs clinically plausible lead/window tokens.
 - **Deletion AUC**: faithfulness metric based on removing highlighted regions and measuring prediction drop.
 - **Extra‑beat stability**: how consistent explanations remain under a controlled augmentation that inserts a heartbeat.
+
+
